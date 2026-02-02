@@ -1,123 +1,207 @@
-#include <bits/stdc++.h>
+#include <iostream>
+#include <vector>
+#include <unordered_map>
+#include <string>
+#include <cstring>
+#include <format>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/select.h>
-using namespace std;
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <cerrno>
 
 #define BUFSZ 1024
-char buf[BUFSZ];
-vector<int> clis;
-map<string, int> usr2sock;
-map<int, string> sock2usr;
+#define MAX_EVENTS 1024
 
-string src, tgt, msg;
+std::unordered_map<std::string, int> usr2sock;
+std::unordered_map<int, std::string> sock2usr;
 
-inline void split_msg(int len){
-    tgt = msg = "";
-    int tgtlen = 0, i = 0;
-    while(buf[i] != '#' && i < len){
-        tgtlen = tgtlen * 10 + (buf[i] - '0');
-        i++;
-    }
-    i++;
-    while(tgtlen-- && i < len) tgt += buf[i++];
-    while(i < len) msg += buf[i++];
+inline void dbg() {
+    std::cout << "123" << std::endl;
 }
 
-int main(int argc, char *argv[]){
-    if(argc != 2){
-        cerr << format("Usage: {} <Port>\n", argv[0]);
+// 设置 socket 为非阻塞
+inline void set_nonblocking(int fd);
+
+// 解析消息：【发件人长度】#【发件人】【消息内容】
+inline void split_msg(const char* buf, int len, std::string& to, std::string& msg);
+
+// 发送消息
+inline void send_msg(int fd, const std::string& from, const std::string& msg);
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        std::cerr << std::format("Usage: {} <Port>\n", argv[0]) << std::endl;
+        exit(1);
+    }
+    int port = atoi(argv[1]);
+
+    int listen_sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (listen_sock < 0) {
+        perror("socket");
         exit(1);
     }
 
-    int srv_sock = socket(PF_INET, SOCK_STREAM, 0);
-    if(srv_sock < 0){
-        cerr << "Socket creating failed.\n";
+    // 允许重用 TIME_WAIT 的本地地址
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (bind(listen_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(listen_sock);
         exit(1);
     }
 
-    sockaddr_in srv_addr{};
-    srv_addr.sin_family = AF_INET;
-    srv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    srv_addr.sin_port = htons(atoi(argv[1]));
-
-    if(bind(srv_sock, (sockaddr *)&srv_addr, sizeof(srv_addr)) < 0){
-        cerr << "Binding failed.\n";
+    if (listen(listen_sock, 10) < 0) {
+        perror("listen");
+        close(listen_sock);
         exit(1);
     }
-    if(listen(srv_sock, 5) < 0){
-        cerr << "Listening failed.\n";
+
+    // 创建 epoll 实例
+    int epfd = epoll_create1(0);
+    if (epfd < 0) {
+        perror("epoll_create1");
+        close(listen_sock);
         exit(1);
     }
-    cout << "Server started, waiting for connection..." << endl;
 
-    fd_set fds, tot_fds;
-    FD_ZERO(&tot_fds);
-    FD_SET(srv_sock, &tot_fds);
-    int mxfd = srv_sock;
+    // 构造要注册到 epoll 的事件结构
+    epoll_event ev;
+    ev.events = EPOLLIN;            // 关注可读事件
+    ev.data.fd = listen_sock;
 
-    while(1){
-        fds = tot_fds;
-        int ready = select(mxfd + 1, &fds, nullptr, nullptr, nullptr);
-        if(ready < 0){
-            cerr << "Select error.\n";
+    // 将监听 socket 加入 epoll 监控
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &ev) < 0) {
+        perror("epoll_ctl listen_sock");
+        close(epfd);
+        close(listen_sock);
+        exit(1);
+    }
+
+    std::cout << std::format("Server started on port {}\n", port) << std::endl;
+
+    std::vector<epoll_event> events(MAX_EVENTS);
+    char buf[BUFSZ];
+
+    while (1) {
+        // 等待事件发生，-1表示无事件时永久阻塞，返回就绪事件数量
+        int nfds = epoll_wait(epfd, events.data(), MAX_EVENTS, -1);
+
+        if (nfds < 0) {
+            if (errno == EINTR) continue;       // 被信号中断，重试
+            perror("epoll_wait");
             break;
         }
 
-        // 用监听 socket ：如果有新连接
-        if(FD_ISSET(srv_sock, &fds)){
-            sockaddr_in cli_addr{};
-            socklen_t cli_addr_sz = sizeof(cli_addr);
-            int cli_sock = accept(srv_sock, (sockaddr *)&cli_addr, &cli_addr_sz);
-            if(cli_sock >= 0){
-                FD_SET(cli_sock, &tot_fds);
-                clis.push_back(cli_sock);
-                mxfd = max(mxfd, cli_sock);
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events[i].data.fd;
 
-                // 接收客户端第三个参数（用户名）
+            // 如果有新连接
+            if (fd == listen_sock) {
+                sockaddr_in cli_addr;
+                socklen_t cli_len = sizeof(cli_addr);
+
+                int cli_sock = accept(listen_sock, (sockaddr*)&cli_addr, &cli_len);
+                if (cli_sock < 0) {
+                    perror("accept");
+                    continue;
+                }
+
+                // 立即接收用户名
                 int len = recv(cli_sock, buf, BUFSZ - 1, 0);
                 buf[len] = '\0';
+
+                // 用户名已存在则报错并关闭连接
+                if (usr2sock.find(buf) != usr2sock.end()) {
+                    send_msg(cli_sock, "Server", std::format("Username {} already in use.", buf));
+                    std::cout << std::format("Rejected {}:{}, Duplicate username {}\n", 
+                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), buf) << std::endl;
+                    close(cli_sock);
+                    continue;
+                }
+
                 usr2sock[buf] = cli_sock, sock2usr[cli_sock] = buf;
 
-                cout << format("Client connected, username: {}", buf) << endl;
+                // 防止后续 recv 阻塞整个线程
+                set_nonblocking(cli_sock);
+
+                epoll_event ev;
+                ev.events = EPOLLIN;
+                ev.data.fd = cli_sock;
+
+                if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
+                    perror("epoll_ctl add client");
+                    close(cli_sock);
+                    continue;
+                }
+
+                std::cout << std::format("New connection: {}:{}, Username: {}\n", 
+                    inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), buf) << std::endl;
+                continue;
             }
-        }
 
-        for(auto it = clis.begin(); it != clis.end(); it++){
-            int u = *it;
+            // 如果已连接的客户端有可读数据
+            if (events[i].events & EPOLLIN) {
+                int len = recv(fd, buf, BUFSZ - 1, 0);
 
-            // 如果当前遍历到的客户端有数据过来
-            if(FD_ISSET(u, &fds)){
-                int len = recv(u, buf, BUFSZ - 1, 0);
-                src = sock2usr[u];
-
-                // 必须带等号
-                if(len <= 0){
-                    cerr << format("Client {} disconnected.\n", src);
-                    close(u);
-                    FD_CLR(u, &tot_fds);
-
-                    usr2sock.erase(src), sock2usr.erase(u);
-
-                    it = clis.erase(it);
-                    it--;
+                // 如果连接关闭或出错
+                if (len <= 0) {
+                    std::string usr = sock2usr[fd];
+                    std::cout << std::format("Client disconnected: {}\n", usr) << std::endl;
+                    usr2sock.erase(usr), sock2usr.erase(fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);        // 移除 epoll 监控
+                    close(fd);
                     continue;
                 }
 
                 buf[len] = '\0';
-                split_msg(len);
-                cout << format("\nFrom: {}\nTo: {}\nContent: {}\n", src, tgt, msg) << endl;
+                std::string from = sock2usr[fd], to, msg;
+                split_msg(buf, len, to, msg);
+                std::cout << std::format("From: {}\nTo: {}\nContent: {}\n", 
+                    from, to, msg) << std::endl;
 
-                // 发给对应的客户端，拼接消息：【发件人长度】#【发件人】【消息内容】
-                int v = usr2sock[tgt];
-                msg = to_string(src.length()) + "#" + src + msg;
-                send(v, msg.c_str(), msg.length(), 0);
+                auto it = usr2sock.find(to);
+
+                // 如果目标用户不存在，给发送方报错
+                if (it == usr2sock.end())
+                    send_msg(fd, "Server", std::format("User {} does not exist.", to));
+                else
+                    send_msg(it->second, from, msg);
             }
         }
     }
 
-    close(srv_sock);
-    cout << "Exited." << endl;
+    close(epfd);
+    close(listen_sock);
     return 0;
+}
+
+inline void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+inline void split_msg(const char* buf, int len, std::string& to, std::string& msg) {
+    int i{}, tolen{};
+    while (i < len && buf[i] != '#') {
+        tolen = tolen * 10 + (buf[i] - '0');
+        i++;
+    }
+    i++;
+    to = std::string(buf + i, tolen);
+    i += tolen;
+    msg = std::string(buf + i, len - i);
+}
+
+inline void send_msg(int fd, const std::string& from, const std::string& msg) {
+    std::string s = std::to_string(from.length()) + "#" + from + msg;
+    send(fd, s.c_str(), s.length(), 0);
 }
