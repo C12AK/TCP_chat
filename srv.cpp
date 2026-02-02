@@ -33,7 +33,7 @@ inline void send_msg(int fd, const std::string& from, const std::string& msg);
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        std::cerr << std::format("Usage: {} <Port>\n", argv[0]) << std::endl;
+        std::cerr << std::format("Usage: {} <Port>\n", argv[0]);
         exit(1);
     }
     int port = atoi(argv[1]);
