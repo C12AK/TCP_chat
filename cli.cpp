@@ -27,6 +27,7 @@ int main(int argc, char* argv[]) {
 
     if (connect(sock, (sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
         perror("connect");
+        close(sock);
         exit(1);
     }
     std::cout << "Connected to server.\n";
@@ -51,6 +52,7 @@ int main(int argc, char* argv[]) {
         int ready = select(mxfd + 1, &fds, nullptr, nullptr, nullptr);
         if (ready < 0) {
             perror("select");
+            close(sock);
             exit(1);
         }
 
