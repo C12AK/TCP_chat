@@ -6,6 +6,10 @@
 
 #define BUFSZ 1024
 
+// 发送消息
+inline void send_msg(int sock, const std::string& to, const std::string& msg);
+
+// 解析消息
 inline void split_msg(const char* buf, int len, std::string& from, std::string& msg);
 
 int main(int argc, char* argv[]) {
@@ -13,6 +17,7 @@ int main(int argc, char* argv[]) {
         std::cerr << std::format("Usage: {} <Server IP> <Server Port> <Username>\n", argv[0]);
         exit(1);
     }
+    int srv_port = atoi(argv[2]);
 
     int sock = socket(PF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -23,7 +28,7 @@ int main(int argc, char* argv[]) {
     sockaddr_in srv_addr{};
     srv_addr.sin_family = AF_INET;
     srv_addr.sin_addr.s_addr = inet_addr(argv[1]);
-    srv_addr.sin_port = htons(atoi(argv[2]));
+    srv_addr.sin_port = htons(srv_port);
 
     if (connect(sock, (sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
         perror("connect");
@@ -82,10 +87,8 @@ int main(int argc, char* argv[]) {
             // 没设收件人则设置
             if (!to.length()) to = msg;
 
-            // 否则拼接消息：【收件人长度】#【收件人】【消息内容】
             else {
-                msg = std::to_string(to.length()) + "#" + to + msg;
-                send(sock, msg.c_str(), msg.length(), 0);
+                send_msg(sock, to, msg);
                 to = "";
                 std::cout << "- SENT\n" << std::endl;
             }
@@ -97,14 +100,21 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
+// 消息格式：发送/接收方长度 (2B) + [发送/接收方 + 消息内容 + '\0'] (至多共 1022 B)
+inline void send_msg(int sock, const std::string& to, const std::string& msg) {
+    uint16_t tolen = htons(static_cast<uint16_t>(to.length()));
+    std::string pck;
+    pck.reserve(sizeof(tolen) + to.length() + msg.length());
+    pck.append(reinterpret_cast<const char*>(&tolen), sizeof(tolen));
+    pck += to, pck += msg;
+    send(sock, pck.c_str(), pck.length(), 0);
+}
+
 inline void split_msg(const char* buf, int len, std::string& from, std::string& msg) {
-    int i{}, tolen{};
-    while (i < len && buf[i] != '#') {
-        tolen = tolen * 10 + (buf[i] - '0');
-        i++;
-    }
-    i++;
-    from = std::string(buf + i, tolen);
-    i += tolen;
-    msg = std::string(buf + i, len - i);
+    uint16_t n_fromlen;
+    std::memcpy(&n_fromlen, buf, sizeof(n_fromlen));
+    int fromlen = ntohs(n_fromlen);
+
+    from = std::string(buf + 2, fromlen);
+    msg = std::string(buf + 2 + fromlen, len - (2 + fromlen));
 }

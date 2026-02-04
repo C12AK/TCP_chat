@@ -21,11 +21,11 @@ std::unordered_map<int, std::string> sock2usr;
 // 设置 socket 为非阻塞
 inline void set_nonblocking(int fd);
 
-// 解析消息：【发件人长度】#【发件人】【消息内容】
-inline void split_msg(const char* buf, int len, std::string& to, std::string& msg);
-
 // 发送消息
 inline void send_msg(int fd, const std::string& from, const std::string& msg);
+
+// 解析消息
+inline void split_msg(const char* buf, int len, std::string& to, std::string& msg);
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
@@ -182,16 +182,20 @@ int main(int argc, char* argv[]) {
                 buf[len] = '\0';
                 std::string from = sock2usr[fd], to, msg;
                 split_msg(buf, len, to, msg);
-                std::cout << std::format("\nFrom: {}\nTo: {}\nContent: {}\n", 
-                    from, to, msg) << std::endl;
-
                 auto it = usr2sock.find(to);
 
                 // 如果目标用户不存在，给发送方报错
-                if (it == usr2sock.end())
-                    send_msg(fd, "Server", std::format("User {} does not exist.", to));
-                else
+                if (it == usr2sock.end()) {
+                    send_msg(fd, "Server", "No such user.");
+                    std::cout << std::format("\nFrom: {}\nTo: {} (No such user)\nContent: {}\n", 
+                        from, to, msg) << std::endl;
+                }
+                    
+                else {
                     send_msg(it->second, from, msg);
+                    std::cout << std::format("\nFrom: {}\nTo: {}\nContent: {}\n", 
+                        from, to, msg) << std::endl;
+                }   
             }
         }
     }
@@ -206,19 +210,21 @@ inline void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-inline void split_msg(const char* buf, int len, std::string& to, std::string& msg) {
-    int i{}, tolen{};
-    while (i < len && buf[i] != '#') {
-        tolen = tolen * 10 + (buf[i] - '0');
-        i++;
-    }
-    i++;
-    to = std::string(buf + i, tolen);
-    i += tolen;
-    msg = std::string(buf + i, len - i);
+// 消息格式：发送/接收方长度 (2B) + [发送/接收方 + 消息内容 + '\0'] (至多共 1022 B)
+inline void send_msg(int fd, const std::string& from, const std::string& msg) {
+    uint16_t fromlen = htons(static_cast<uint16_t>(from.length()));
+    std::string pck;
+    pck.reserve(sizeof(fromlen) + from.length() + msg.length());
+    pck.append(reinterpret_cast<const char*>(&fromlen), sizeof(fromlen));
+    pck += from, pck += msg;
+    send(fd, pck.c_str(), pck.length(), 0);
 }
 
-inline void send_msg(int fd, const std::string& from, const std::string& msg) {
-    std::string s = std::to_string(from.length()) + "#" + from + msg;
-    send(fd, s.c_str(), s.length(), 0);
+inline void split_msg(const char* buf, int len, std::string& to, std::string& msg) {
+    uint16_t n_tolen;
+    std::memcpy(&n_tolen, buf, sizeof(n_tolen));
+    int tolen = ntohs(n_tolen);
+
+    to = std::string(buf + 2, tolen);
+    msg = std::string(buf + 2 + tolen, len - (2 + tolen));
 }
