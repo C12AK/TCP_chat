@@ -18,10 +18,6 @@
 std::unordered_map<std::string, int> usr2sock;
 std::unordered_map<int, std::string> sock2usr;
 
-inline void dbg() {
-    std::cout << "123" << std::endl;
-}
-
 // 设置 socket 为非阻塞
 inline void set_nonblocking(int fd);
 
@@ -86,7 +82,7 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    std::cout << std::format("Server started on port {}\n", port) << std::endl;
+    std::cout << std::format("Server started on port {}", port) << std::endl;
 
     std::vector<epoll_event> events(MAX_EVENTS);
     char buf[BUFSZ];
@@ -117,12 +113,28 @@ int main(int argc, char* argv[]) {
 
                 // 立即接收用户名
                 int len = recv(cli_sock, buf, BUFSZ - 1, 0);
+
+                // 如果刚连接就断开
+                if (len == 0) {
+                    std::cout << std::format("New connection closed on accepting: {}:{}", 
+                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
+                    close(cli_sock);
+                    continue;
+                }
+
+                // 如果出错
+                else if (len < 0) {
+                    perror("recv");
+                    close(cli_sock);
+                    continue;
+                }
+
                 buf[len] = '\0';
 
                 // 用户名已存在则报错并关闭连接
                 if (usr2sock.find(buf) != usr2sock.end()) {
                     send_msg(cli_sock, "Server", std::format("Username {} already in use.", buf));
-                    std::cout << std::format("Rejected {}:{}, Duplicate username {}\n", 
+                    std::cout << std::format("Rejected {}:{}, Duplicate username {}", 
                         inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), buf) << std::endl;
                     close(cli_sock);
                     continue;
@@ -143,7 +155,7 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                std::cout << std::format("New connection: {}:{}, Username: {}\n", 
+                std::cout << std::format("New connection: {}:{}, Username: {}", 
                     inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), buf) << std::endl;
                 continue;
             }
@@ -155,7 +167,12 @@ int main(int argc, char* argv[]) {
                 // 如果连接关闭或出错
                 if (len <= 0) {
                     std::string usr = sock2usr[fd];
-                    std::cout << std::format("Client disconnected: {}\n", usr) << std::endl;
+
+                    if (len == 0)
+                        std::cout << std::format("Client disconnected: {}", usr) << std::endl;
+                    else
+                        perror("recv");
+                    
                     usr2sock.erase(usr), sock2usr.erase(fd);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);        // 移除 epoll 监控
                     close(fd);
@@ -165,7 +182,7 @@ int main(int argc, char* argv[]) {
                 buf[len] = '\0';
                 std::string from = sock2usr[fd], to, msg;
                 split_msg(buf, len, to, msg);
-                std::cout << std::format("From: {}\nTo: {}\nContent: {}\n", 
+                std::cout << std::format("\nFrom: {}\nTo: {}\nContent: {}\n", 
                     from, to, msg) << std::endl;
 
                 auto it = usr2sock.find(to);

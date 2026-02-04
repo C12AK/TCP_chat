@@ -59,7 +59,17 @@ int main(int argc, char* argv[]) {
         // 如果是有服务器消息
         if (FD_ISSET(sock, &fds)) {
             int len = recv(sock, buf, BUFSZ - 1, 0);
-            if (len <= 0) break;
+
+            // 如果服务器关闭或接收出错
+            if (len == 0) {
+                std::cout << "Server closed." << std::endl;
+                break;
+            }
+            else if (len < 0) {
+                perror("recv");
+                break;
+            }
+            
             buf[len] = '\0';
             split_msg(buf, len, from, msg);
             std::cout << format("\n> {}:\n> {}\n", from, msg) << std::endl;
