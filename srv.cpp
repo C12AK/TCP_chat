@@ -29,7 +29,7 @@ inline void split_msg(const char* buf, int len, std::string& to, std::string& ms
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        std::cerr << std::format("Usage: {} <Port>\n", argv[0]);
+        std::cerr << std::format("Usage: {} <Port>", argv[0]) << std::endl;
         exit(1);
     }
     int port = atoi(argv[1]);
@@ -87,6 +87,13 @@ int main(int argc, char* argv[]) {
     std::vector<epoll_event> events(MAX_EVENTS);
     char buf[BUFSZ];
 
+    // 用于清除一个连接
+    auto rmusr = [&](int& sock, std::string& usr) -> void {
+        usr2sock.erase(usr), sock2usr.erase(sock);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, sock, nullptr);      // 移除 epoll 监控
+        close(sock);
+    };
+
     while (1) {
         // 等待事件发生，-1表示无事件时永久阻塞，返回就绪事件数量
         int nfds = epoll_wait(epfd, events.data(), MAX_EVENTS, -1);
@@ -99,8 +106,9 @@ int main(int argc, char* argv[]) {
 
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
+            uint32_t evs = events[i].events;
 
-            // 如果有新连接
+            // 1. 如果有新连接
             if (fd == listen_sock) {
                 sockaddr_in cli_addr;
                 socklen_t cli_len = sizeof(cli_addr);
@@ -145,8 +153,9 @@ int main(int argc, char* argv[]) {
                 // 防止后续 recv 阻塞整个线程
                 set_nonblocking(cli_sock);
 
+                // 客户 socket 还要注册 EPOLLRDHUP ，而 EPOLLERR 和 EPOLLHUP 是自动报告的
                 epoll_event ev;
-                ev.events = EPOLLIN;
+                ev.events = EPOLLIN | EPOLLRDHUP;
                 ev.data.fd = cli_sock;
 
                 if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
@@ -160,22 +169,31 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // 如果已连接的客户端有可读数据
+            // 2. 检查错误或挂起事件
+            if (evs & (EPOLLERR | EPOLLHUP)) {
+                std::string usr = sock2usr[fd];
+                std::cerr << std::format("Client {} error or hangup", usr) << std::endl;
+                rmusr(fd, usr);
+                continue;
+            }
+
+            // 3. 检查对端关闭写端（省去用 recv 判断）
+            if (evs & EPOLLRDHUP) {
+                std::string usr = sock2usr[fd];
+                std::cout << std::format("Client {} closed connection", usr) << std::endl;
+                rmusr(fd, usr);
+                continue;
+            }
+
+            // 4. 如果已连接的客户端有可读数据
             if (events[i].events & EPOLLIN) {
                 int len = recv(fd, buf, BUFSZ - 1, 0);
 
-                // 如果连接关闭或出错
-                if (len <= 0) {
+                // len == 0 即收到 FIN ，已经用 EPOLLRDHUP 判断
+                if (len < 0) {
                     std::string usr = sock2usr[fd];
-
-                    if (len == 0)
-                        std::cout << std::format("Client disconnected: {}", usr) << std::endl;
-                    else
-                        perror("recv");
-                    
-                    usr2sock.erase(usr), sock2usr.erase(fd);
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);        // 移除 epoll 监控
-                    close(fd);
+                    perror("recv");
+                    rmusr(fd, usr);
                     continue;
                 }
 
