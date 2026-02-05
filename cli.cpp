@@ -1,7 +1,10 @@
-#include <bits/stdc++.h>
+#include <iostream>
+#include <cstring>
+#include <format>
 #include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/select.h>
 
 #define BUFSZ 1024
@@ -14,10 +17,9 @@ inline void split_msg(const char* buf, int len, std::string& from, std::string& 
 
 int main(int argc, char* argv[]) {
     if (argc != 4) {
-        std::cerr << std::format("Usage: {} <Server IP> <Server Port> <Username>\n", argv[0]);
+        std::cerr << std::format("Usage: {} <Server IP> <Server Port> <Username>", argv[0]) << std::endl;
         exit(1);
     }
-    int srv_port = atoi(argv[2]);
 
     int sock = socket(PF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -28,7 +30,7 @@ int main(int argc, char* argv[]) {
     sockaddr_in srv_addr{};
     srv_addr.sin_family = AF_INET;
     srv_addr.sin_addr.s_addr = inet_addr(argv[1]);
-    srv_addr.sin_port = htons(srv_port);
+    srv_addr.sin_port = htons(atoi(argv[2]));
 
     if (connect(sock, (sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
         perror("connect");
