@@ -37,9 +37,7 @@ int main(int argc, char* argv[]) {
         close(sock);
         exit(1);
     }
-    std::cout << "Connected to server.\n";
-    std::cout << "Usage: <Target user>(Line 1) + <Message>(Line 2)\n";
-    std::cout << "Input \".exit\"(without quotes) at any time to exit.\n" << std::endl;
+    std::cout << "Initializing, plz wait...\n" << std::endl;
 
     // 用户名发给服务器
     send(sock, argv[3], strlen(argv[3]), 0);
