@@ -9,12 +9,15 @@
 
 #define BUFSZ 1024
 
-// 发送消息
-inline void send_msg(int sock, const std::string& to, const std::string& msg);
 
-// 解析消息
-inline void split_msg(const char* buf, int len, std::string& from, std::string& msg);
+// ==================== 工具函数 ====================
+inline void send_msg(int sock, const std::string& to, const std::string& msg);  // 发送消息
+void Send(int sock, const char* sp, int len);
 
+inline void process_msg(const char* buf, int len, std::string& from, std::string& msg); // 拆解消息
+
+
+// ==================== 主函数 ====================
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         std::cerr << std::format("Usage: {} <Server IP> <Server Port> <Username>", argv[0]) << std::endl;
@@ -45,7 +48,8 @@ int main(int argc, char* argv[]) {
     fd_set fds;
     int mxfd = std::max(sock, fileno(stdin));
     char buf[BUFSZ];
-    std::string from, to, msg;
+    std::string from, to, msg, recvbuf;
+    int expected_len = -1;
 
     while (1) {
         // 重新初始化可读事件的文件描述符集合，应包含服务器消息和键盘输入
@@ -69,15 +73,32 @@ int main(int argc, char* argv[]) {
             if (len == 0) {
                 std::cout << "Server closed." << std::endl;
                 break;
-            }
-            else if (len < 0) {
+            } else if (len < 0) {
                 perror("recv");
                 break;
             }
-            
+
             buf[len] = '\0';
-            split_msg(buf, len, from, msg);
-            std::cout << format("\n> {}:\n> {}\n", from, msg) << std::endl;
+            recvbuf.append(buf, len);
+
+            // 设置期望长度
+            if (expected_len == -1 && recvbuf.length() >= 6ul) {
+                uint16_t n_fromlen;
+                uint32_t n_msglen;
+                memcpy(&n_fromlen, recvbuf.c_str(), sizeof(n_fromlen));
+                memcpy(&n_msglen, recvbuf.c_str() + sizeof(n_fromlen), sizeof(n_msglen));
+                expected_len = 6 + static_cast<int>(ntohs(n_fromlen)) + ntohl(n_msglen);
+            }
+
+            // 收到的消息长度够了才处理
+            if (expected_len != -1 && recvbuf.length() >= expected_len) {
+                std::string pck = recvbuf.substr(0, expected_len);
+                recvbuf.erase(0, expected_len);
+                expected_len = -1;
+
+                process_msg(pck.c_str(), pck.length(), from, msg);
+                std::cout << format("\n> {}:\n> {}\n", from, msg) << std::endl;
+            }
         }
 
         // 如果是键盘有输入
@@ -100,21 +121,38 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-// 消息格式：发送/接收方长度 (2B) + [发送/接收方 + 消息内容 + '\0'] (至多共 1022 B)
+
+// ==================== 工具函数实现 ====================
 inline void send_msg(int sock, const std::string& to, const std::string& msg) {
-    uint16_t tolen = htons(static_cast<uint16_t>(to.length()));
+    uint16_t n_tolen = htons(static_cast<uint16_t>(to.length()));
+    uint32_t n_msglen = htonl(static_cast<uint32_t>(msg.length()));
     std::string pck;
-    pck.reserve(sizeof(tolen) + to.length() + msg.length());
-    pck.append(reinterpret_cast<const char*>(&tolen), sizeof(tolen));
+    pck.reserve(sizeof(n_tolen) + sizeof(n_msglen) + to.length() + msg.length());
+    pck.append(reinterpret_cast<const char*>(&n_tolen), sizeof(n_tolen));
+    pck.append(reinterpret_cast<const char*>(&n_msglen), sizeof(n_msglen));
     pck += to, pck += msg;
-    send(sock, pck.c_str(), pck.length(), 0);
+
+    Send(sock, pck.c_str(), pck.length());
 }
 
-inline void split_msg(const char* buf, int len, std::string& from, std::string& msg) {
-    uint16_t n_fromlen;
-    std::memcpy(&n_fromlen, buf, sizeof(n_fromlen));
-    int fromlen = ntohs(n_fromlen);
 
-    from = std::string(buf + 2, fromlen);
-    msg = std::string(buf + 2 + fromlen, len - (2 + fromlen));
+inline void process_msg(const char* pckptr, int len, std::string& from, std::string& msg) {
+    if (len < 6) {
+        from.clear(), msg.clear();
+        return;
+    }
+
+    uint16_t n_fromlen;
+    uint32_t n_msglen;
+    std::memcpy(&n_fromlen, pckptr, sizeof(n_fromlen));
+    std::memcpy(&n_msglen, pckptr + sizeof(n_fromlen), sizeof(n_msglen));
+    int fromlen = ntohs(n_fromlen), msglen = ntohl(n_msglen);
+
+    if (fromlen < 0 || msglen < 0 || 6 + fromlen + msglen > len) {
+        from.clear(), msg.clear();
+        return;
+    }
+
+    from = std::string(pckptr + 6, fromlen);
+    msg = std::string(pckptr + 6 + fromlen, msglen);
 }

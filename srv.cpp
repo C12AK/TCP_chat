@@ -79,8 +79,14 @@ std::unordered_map<std::string, int> usr2sock;
 std::unordered_map<int, std::string> sock2usr;
 std::mutex cli_map_mtx;
 
+std::unordered_map<int, std::string> pcks;  // 存储已经收到的消息
+std::unordered_map<int, int> expected_len;
+std::mutex pcks_mtx;
+
 std::unordered_map<int, std::unique_ptr<std::mutex>> fd_mtxs;   // 每个 fd 设一个锁，防止多个线程同时对同一个 fd send/recv
 std::mutex fdmtx_map_mtx;
+
+thread_local char buf[BUFSZ];   // 每个线程一份，收发消息的缓冲区
 
 
 // ==================== 工具函数 ====================
@@ -93,10 +99,13 @@ void submit_send_task(ThreadPool& pool, int fd, const std::string& from, const s
 // 和 submit_send_task() 几乎一样 ([2]) ，专用于拒绝用户名已使用的连接
 void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, const std::string& msg);
 
-// 发送消息
+// 组装并发送消息
 void send_msg(int fd, const std::string& from, const std::string& msg);
 
-// 处理收到的消息
+// 循环发送任意长字符串
+void Send(int sock, const char* sp, int len);
+
+// 拆解收到的消息
 void process_msg(const char* buf, int len, std::string& to, std::string& msg);
 
 // 移除一个用户
@@ -160,8 +169,7 @@ int main(int argc, char* argv[]) {
 
     ThreadPool pool(std::thread::hardware_concurrency());   // 创建线程池，使用硬件支持的并发数
 
-    std::vector<epoll_event> events(MAX_EVENTS);
-    char buf[BUFSZ];
+    std::vector<epoll_event> events(MAX_EVENTS);    // 为就绪事件准备的缓冲区
 
     while (1) {
         int nfds = epoll_wait(epfd, events.data(), MAX_EVENTS, -1); // 等待事件到来，永久阻塞直到有事件
@@ -185,59 +193,61 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // 立即提交 处理新连接用户名 的任务到线程池
-                pool.enqueue([cli_sock, cli_addr, epfd, &pool]() {
-                    char init_buf[BUFSZ];
-                    int len = recv(cli_sock, init_buf, BUFSZ - 1, 0);
-                    if (len <= 0) {
-                        std::cout << std::format("New connection closed on accepting: {}:{}", 
-                            inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
-                        close(cli_sock);
-                        return;
-                    }
-                    init_buf[len] = '\0';
-                    std::string username(init_buf, len);
+                // 立即处理新连接用户名。按目前的处理流程，这段可以提交到线程池，但容易逻辑混乱
+                int len = recv(cli_sock, buf, BUFSZ - 1, 0);
+                if (len <= 0) {
+                    std::cout << std::format("New connection closed on accepting: {}:{}", 
+                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
+                    close(cli_sock);
+                    continue;
+                }
+                buf[len] = '\0';
+                std::string username(buf, len);
 
-                    bool dupf = false;
+                bool dupf = false;
+                {
+                    std::lock_guard<std::mutex> lock(cli_map_mtx);
+                    if (usr2sock.find(username) != usr2sock.end()) {
+                        dupf = true;                                    // 如果用户名已被占用，接下来处理
+                    } else {
+                        usr2sock[username] = cli_sock;                  // 未占用则记录
+                        sock2usr[cli_sock] = username;
+                        {
+                            std::lock_guard<std::mutex> lock2(pcks_mtx);     // 加锁清空已有消息
+                            pcks[cli_sock].clear();
+                            expected_len[cli_sock] = -1;
+                        }
+                    }
+                }
+
+                if (dupf) {
+                    submit_send_task_reject(pool, cli_sock, "Server", 
+                        std::format("Username {} already in use.", username));          // 通知用户：拒绝
+                    std::cout << std::format("Rejected {}:{}, Duplicate username {}", 
+                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
+                    continue;
+                }
+
+                set_nonblocking(cli_sock);  // 这里才设置非阻塞
+
+                epoll_event ev{};
+                ev.events = EPOLLIN | EPOLLRDHUP;   // 对于客户 socket ，关注可读 + 对端关闭写端
+                ev.data.fd = cli_sock;
+                if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
+                    perror("epoll_ctl add client");
                     {
                         std::lock_guard<std::mutex> lock(cli_map_mtx);
-                        if (usr2sock.find(username) != usr2sock.end()) {
-                            dupf = true;                                    // 如果用户名已被占用，接下来处理
-                        } else {
-                            usr2sock[username] = cli_sock;                  // 未占用则记录
-                            sock2usr[cli_sock] = username;
-                        }
+                        rm_usr(cli_sock, username);
                     }
+                    continue;
+                }
 
-                    if (dupf) {
-                        submit_send_task_reject(pool, cli_sock, "Server", 
-                            std::format("Username {} already in use.", username));          // 通知用户：拒绝
-                        std::cout << std::format("Rejected {}:{}, Duplicate username {}", 
-                            inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
-                        return;
-                    }
-
-                    set_nonblocking(cli_sock);  // 这里才设置非阻塞
-
-                    epoll_event ev{};
-                    ev.events = EPOLLIN | EPOLLRDHUP;   // 对于客户 socket ，关注可读 + 对端关闭写端
-                    ev.data.fd = cli_sock;
-                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
-                        perror("epoll_ctl add client");
-                        {
-                            std::lock_guard<std::mutex> lock(cli_map_mtx);
-                            rm_usr(cli_sock, username);
-                        }
-                        return;
-                    }
-
-                    submit_send_task(pool, cli_sock, "Server", 
-                        "\tConnected to server.\n"
-                        "\tUsage: <Target user>(Line 1) + <Message>(Line 2)\n"
-                        "\tInput \".exit\"(without quotes) at any time to exit.");            // 通知用户：已连接
-                    std::cout << std::format("New connection: {}:{}, Username: {}", 
-                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
-                });
+                submit_send_task(pool, cli_sock, "Server", 
+                    "\tConnected to server.\n"
+                    "\tUsage: <Target user>(Line 1) + <Message>(Line 2)\n"
+                    "\tInput \".exit\"(without quotes) at any time to exit.");            // 通知用户：已连接
+                std::cout << std::format("New connection: {}:{}, Username: {}", 
+                    inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
                 continue;
             }
 
@@ -269,9 +279,9 @@ int main(int argc, char* argv[]) {
 
             // 3. 如果有可读数据
             if (evs & EPOLLIN) {
-                int len = recv(fd, buf, BUFSZ - 1, 0);
+                int len = recv(fd, buf, BUFSZ - 1, 0);  // 读写缓冲区分离，主线程 recv 不用加锁
 
-                // 理论上 len=0 已经被上面 EPOLLRDHUP 检测到
+                // 理论上 len = 0 已经被上面 EPOLLRDHUP 检测到
                 if (len <= 0) {
                     std::string usr;
                     {
@@ -291,7 +301,32 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                std::string pck(buf, len);
+                buf[len] = '\0';
+
+                std::string pck;
+                {
+                    std::lock_guard<std::mutex> lock(pcks_mtx);
+                    pcks[fd].append(buf, len);
+
+                    // 设置期望长度
+                    if (expected_len[fd] == -1 && pcks[fd].length() >= 6ul) {
+                        uint16_t n_tolen;
+                        uint32_t n_msglen;
+                        memcpy(&n_tolen, pcks[fd].c_str(), sizeof(n_tolen));
+                        memcpy(&n_msglen, pcks[fd].c_str() + sizeof(n_tolen), sizeof(n_msglen));
+                        expected_len[fd] = 6 + static_cast<int>(ntohs(n_tolen)) + ntohl(n_msglen);
+                    }
+
+                    // 已经存在一个完整的包，就处理
+                    if (expected_len[fd] != -1 && pcks[fd].length() >= expected_len[fd]) {
+                        pck = pcks[fd].substr(0, expected_len[fd]);
+                        pcks[fd].erase(0, expected_len[fd]);
+                        expected_len[fd] = -1;
+                    }
+                }
+                if (pck.empty()) continue;
+
+                // 查找发送方用户名
                 std::string from;
                 {
                     std::lock_guard<std::mutex> lock(cli_map_mtx);
@@ -317,6 +352,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     if (tofd == -1) {
+                        // 其实单线程 Reactor 最好将 send 和 recv 全部放到主线程，但已经用线程池实现了，且逻辑正确
                         submit_send_task(pool, fd, "Server", "No such user.");
                         std::cout << std::format("\nFrom: {}\nTo: {} (No such user)\nContent: {}\n", 
                             from, to, msg) << std::endl;
@@ -354,7 +390,7 @@ void submit_send_task(ThreadPool& pool, int fd, const std::string& from, const s
             auto new_mtx = std::make_unique<std::mutex>();                              // 当前 fd 没有 mutex ，新建一个
 
             // 通过自定义 deleter 为空的 shared_ptr 借用指针，delete 仍然由 unique_ptr 负责
-            mtx_ptr = std::shared_ptr<std::mutex>(new_mtx.get(), [](std::mutex*){});    
+            mtx_ptr = std::shared_ptr<std::mutex>(new_mtx.get(), [](std::mutex*){});
 
             // unique_ptr new_mtx 被转移给 fd_mtxs[fd] ，delete 也就由 fd_mtxs 存的这一项负责了
             fd_mtxs[fd] = std::move(new_mtx);
@@ -393,40 +429,49 @@ void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, 
 
 void send_msg(int fd, const std::string& from, const std::string& msg) {
     uint16_t n_fromlen = htons(static_cast<uint16_t>(from.length()));
+    uint32_t n_msglen = htonl(static_cast<uint32_t>(msg.length()));
 
     std::string pck;
-    pck.reserve(sizeof(n_fromlen) + from.length() + msg.length());
+    pck.reserve(sizeof(n_fromlen) + sizeof(n_msglen) + from.length() + msg.length());
 
     pck.append(reinterpret_cast<const char*>(&n_fromlen), sizeof(n_fromlen));
+    pck.append(reinterpret_cast<const char*>(&n_msglen), sizeof(n_msglen));
     pck += from, pck += msg;
 
-    send(fd, pck.c_str(), pck.length(), MSG_NOSIGNAL);
+    Send(fd, pck.c_str(), pck.length());
 }
 
 
-void process_msg(const char* buf, int len, std::string& to, std::string& msg) {
-    if (len < 2) {
+void process_msg(const char* pckptr, int len, std::string& to, std::string& msg) {
+    if (len < 6) {
         to.clear(), msg.clear();
         return;
     }
 
     uint16_t n_tolen;
-    std::memcpy(&n_tolen, buf, sizeof(n_tolen));
-    int tolen = ntohs(n_tolen);
+    uint32_t n_msglen;
+    std::memcpy(&n_tolen, pckptr, sizeof(n_tolen));
+    std::memcpy(&n_msglen, pckptr + sizeof(n_tolen), sizeof(n_msglen));
+    int tolen = ntohs(n_tolen), msglen = ntohl(n_msglen);
 
-    if (tolen < 0 || 2 + tolen > len) {
+    if (tolen < 0 || msglen < 0 || 6 + tolen + msglen > len) {
         to.clear(), msg.clear();
         return;
     }
 
-    to = std::string(buf + 2, tolen);
-    msg = std::string(buf + 2 + tolen, len - (2 + tolen));
+    to = std::string(pckptr + 6, tolen);
+    msg = std::string(pckptr + 6 + tolen, msglen);
 }
 
 
 inline void rm_usr(int sock, const std::string& usr) {
     usr2sock.erase(usr);    // 保证每次调用时 cli_map_mtx 都已经上锁
     sock2usr.erase(sock);
+    {
+        std::lock_guard<std::mutex> lock(pcks_mtx);
+        pcks.erase(sock);
+        expected_len.erase(sock);
+    }
     {
         std::lock_guard<std::mutex> lock(fdmtx_map_mtx);
         fd_mtxs.erase(sock);
