@@ -340,7 +340,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // 提交消息处理任务到线程池
-                pool.enqueue([pck, from, fd, epfd, &pool]() {
+                pool.enqueue([pck = std::move(pck), from = std::move(from), fd, epfd, &pool]() {
                     std::string to, msg;
                     process_msg(pck.c_str(), pck.length(), to, msg);
 
@@ -399,7 +399,7 @@ void submit_send_task(ThreadPool& pool, int fd, const std::string& from, const s
         }
     }
 
-    pool.enqueue([fd, from, msg, mtx_ptr]() {
+    pool.enqueue([fd, from = std::move(from), msg = std::move(msg), mtx_ptr]() {
         std::lock_guard<std::mutex> lock(*mtx_ptr);
         send_msg(fd, from, msg);
     });
@@ -419,7 +419,7 @@ void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, 
             mtx_ptr = std::shared_ptr<std::mutex>(it->second.get(), [](std::mutex*){});
         }
     }
-    pool.enqueue([fd, from, msg, mtx_ptr]() {
+    pool.enqueue([fd, from = std::move(from), msg = std::move(msg), mtx_ptr]() {
         std::lock_guard<std::mutex> lock(*mtx_ptr);
         send_msg(fd, from, msg);
         close(fd);                  // [2] 仅在这里追加
