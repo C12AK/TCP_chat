@@ -1,3 +1,5 @@
+#include "crypto.h"
+
 #include <iostream>
 #include <cstring>
 #include <string>
@@ -88,6 +90,12 @@ std::mutex fdmtx_map_mtx;
 
 thread_local char buf[BUFSZ];   // 每个线程一份，收发消息的缓冲区
 
+vecuc rsa_pubkey;                           // 存一份，省时间
+std::unordered_map<int, Crypto> clicrypts;  // Crypto 类不是线程安全的，故为每个连接创建一个
+std::mutex clicrypts_mtx;
+
+thread_local Crypto crypto{};               // 在 send_msg 和 process_msg 中充当临时变量
+
 
 // ==================== 工具函数 ====================
 // 将 fd 设为非阻塞
@@ -106,7 +114,7 @@ void send_msg(int fd, const std::string& from, const std::string& msg);
 void Send(int sock, const char* sp, int len);
 
 // 拆解收到的消息
-void process_msg(const char* buf, int len, std::string& to, std::string& msg);
+void process_msg(int fd, const char* buf, int len, std::string& to, std::string& msg);
 
 // 移除一个用户
 inline void rm_usr(int sock, const std::string& usr);
@@ -165,6 +173,10 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
+    Crypto main_crypto{};   // 仅 RSA
+    main_crypto.generate_key_pair();
+    rsa_pubkey = main_crypto.get_pubkey_der();
+
     std::cout << std::format("Server started on port {}", port) << std::endl;
 
     ThreadPool pool(std::thread::hardware_concurrency());   // 创建线程池，使用硬件支持的并发数
@@ -193,61 +205,76 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // 立即处理新连接用户名。按目前的处理流程，这段可以提交到线程池，但容易逻辑混乱
-                int len = recv(cli_sock, buf, BUFSZ - 1, 0);
-                if (len <= 0) {
-                    std::cout << std::format("New connection closed on accepting: {}:{}", 
-                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
-                    close(cli_sock);
-                    continue;
-                }
-                buf[len] = '\0';
-                std::string username(buf, len);
-
-                bool dupf = false;
-                {
-                    std::lock_guard<std::mutex> lock(cli_map_mtx);
-                    if (usr2sock.find(username) != usr2sock.end()) {
-                        dupf = true;                                    // 如果用户名已被占用，接下来处理
-                    } else {
-                        usr2sock[username] = cli_sock;                  // 未占用则记录
-                        sock2usr[cli_sock] = username;
-                        {
-                            std::lock_guard<std::mutex> lock2(pcks_mtx);     // 加锁清空已有消息
-                            pcks[cli_sock].clear();
-                            expected_len[cli_sock] = -1;
-                        }
+                // 由于 cli_sock 还没加入 map ，所以这个任务结束前不会有其他线程 send/recv cli_sock ，所以是安全的
+                // 为了性能 牺牲逻辑清晰度了 qwq
+                pool.enqueue([cli_sock, cli_addr, epfd, &pool, &main_crypto]() {
+                    int len = recv(cli_sock, buf, BUFSZ - 1, 0);
+                    if (len <= 0) {
+                        std::cout << std::format("New connection closed on accepting: {}:{}", 
+                            inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
+                        close(cli_sock);
+                        return;
                     }
-                }
+                    buf[len] = '\0';
+                    std::string username(buf, len);
 
-                if (dupf) {
-                    submit_send_task_reject(pool, cli_sock, "Server", 
-                        std::format("Username {} already in use.", username));          // 通知用户：拒绝
-                    std::cout << std::format("Rejected {}:{}, Duplicate username {}", 
-                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
-                    continue;
-                }
-
-                set_nonblocking(cli_sock);  // 这里才设置非阻塞
-
-                epoll_event ev{};
-                ev.events = EPOLLIN | EPOLLRDHUP;   // 对于客户 socket ，关注可读 + 对端关闭写端
-                ev.data.fd = cli_sock;
-                if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
-                    perror("epoll_ctl add client");
+                    bool dupf = false;
                     {
                         std::lock_guard<std::mutex> lock(cli_map_mtx);
-                        rm_usr(cli_sock, username);
+                        if (usr2sock.find(username) != usr2sock.end()) {
+                            dupf = true;
+                        } else {
+                            usr2sock[username] = cli_sock;                  // 未占用则记录
+                            sock2usr[cli_sock] = username;
+                            {
+                                std::lock_guard<std::mutex> lock2(pcks_mtx);     // 加锁清空已有消息
+                                pcks[cli_sock].clear();
+                                expected_len[cli_sock] = -1;
+                            }
+                        }
                     }
-                    continue;
-                }
 
-                submit_send_task(pool, cli_sock, "Server", 
-                    "\tConnected to server.\n"
-                    "\tUsage: <Target user>(Line 1) + <Message>(Line 2)\n"
-                    "\tInput \".exit\"(without quotes) at any time to exit.");            // 通知用户：已连接
-                std::cout << std::format("New connection: {}:{}, Username: {}", 
-                    inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
+                    if (dupf) {
+                        submit_send_task_reject(pool, cli_sock, "Server", 
+                            std::format("Username {} already in use.", username));          // 如果用户名已被占用，通知用户
+                        std::cout << std::format("Rejected {}:{}, Duplicate username {}", 
+                            inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
+                        return;
+                    }
+
+                    send(cli_sock, rsa_pubkey.data(), rsa_pubkey.size(), MSG_NOSIGNAL);     // 发送 RSA 公钥，也是告知客户端：收到
+                    len = recv(cli_sock, buf, BUFSZ - 1, 0);                                // 客户端收到后会发送加密的 AES 密钥
+                    if (len <= 0) {
+                        std::cout << std::format("New connection closed after sending username: {}:{}", 
+                            inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
+                        close(cli_sock);
+                        return;
+                    }
+
+                    clicrypts[cli_sock] = Crypto();
+                    clicrypts[cli_sock].aeskey = main_crypto.rsa_decrypt(vecuc(buf, buf + len));    // 设置这个客户端的 aeskey
+
+                    set_nonblocking(cli_sock);  // 这里才设置非阻塞
+
+                    epoll_event ev{};
+                    ev.events = EPOLLIN | EPOLLRDHUP;   // 对于客户 socket ，关注可读 + 对端关闭写端
+                    ev.data.fd = cli_sock;
+                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
+                        perror("epoll_ctl add client");
+                        {
+                            std::lock_guard<std::mutex> lock(cli_map_mtx);
+                            rm_usr(cli_sock, username);
+                        }
+                        return;
+                    }
+
+                    submit_send_task(pool, cli_sock, "Server", 
+                        "\tConnected to server.\n"
+                        "\tUsage: <Target user>(Line 1) + <Message>(Line 2)\n"
+                        "\tInput \".exit\"(without quotes) at any time to exit.");            // 通知用户：已连接
+                    std::cout << std::format("New connection: {}:{}, Username: {}", 
+                        inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
+                });
                 continue;
             }
 
@@ -342,7 +369,7 @@ int main(int argc, char* argv[]) {
                 // 提交消息处理任务到线程池
                 pool.enqueue([pck = std::move(pck), from = std::move(from), fd, epfd, &pool]() {
                     std::string to, msg;
-                    process_msg(pck.c_str(), pck.length(), to, msg);
+                    process_msg(fd, pck.c_str(), pck.length(), to, msg);
 
                     int tofd = -1;
                     {
@@ -428,21 +455,30 @@ void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, 
 
 
 void send_msg(int fd, const std::string& from, const std::string& msg) {
-    uint16_t n_fromlen = htons(static_cast<uint16_t>(from.length()));
-    uint32_t n_msglen = htonl(static_cast<uint32_t>(msg.length()));
+    // 先加密 from 和 msg
+    vecuc key;
+    {
+        std::lock_guard<std::mutex> lock(clicrypts_mtx);
+        key = clicrypts[fd].aeskey;     // 加锁复制，避免在计算密集的加密操作上上锁
+    }
+    crypto.aeskey = key;
+    std::string c_from = crypto.aes_encrypt(from), c_msg = crypto.aes_encrypt(msg);
+
+    uint16_t n_fromlen = htons(static_cast<uint16_t>(c_from.length()));
+    uint32_t n_msglen = htonl(static_cast<uint32_t>(c_msg.length()));
 
     std::string pck;
-    pck.reserve(sizeof(n_fromlen) + sizeof(n_msglen) + from.length() + msg.length());
+    pck.reserve(sizeof(n_fromlen) + sizeof(n_msglen) + c_from.length() + c_msg.length());
 
     pck.append(reinterpret_cast<const char*>(&n_fromlen), sizeof(n_fromlen));
     pck.append(reinterpret_cast<const char*>(&n_msglen), sizeof(n_msglen));
-    pck += from, pck += msg;
+    pck += c_from, pck += c_msg;
 
     Send(fd, pck.c_str(), pck.length());
 }
 
 
-void process_msg(const char* pckptr, int len, std::string& to, std::string& msg) {
+void process_msg(int fd, const char* pckptr, int len, std::string& to, std::string& msg) {
     if (len < 6) {
         to.clear(), msg.clear();
         return;
@@ -459,8 +495,16 @@ void process_msg(const char* pckptr, int len, std::string& to, std::string& msg)
         return;
     }
 
-    to = std::string(pckptr + 6, tolen);
-    msg = std::string(pckptr + 6 + tolen, msglen);
+    // 最后解密 to 和 msg
+    vecuc key;
+    {
+        std::lock_guard<std::mutex> lock(clicrypts_mtx);
+        key = clicrypts[fd].aeskey;
+    }
+    crypto.aeskey = key;
+
+    to = crypto.aes_decrypt(std::string(pckptr + 6, tolen));
+    msg = crypto.aes_decrypt(std::string(pckptr + 6 + tolen, msglen));
 }
 
 
@@ -475,6 +519,10 @@ inline void rm_usr(int sock, const std::string& usr) {
     {
         std::lock_guard<std::mutex> lock(fdmtx_map_mtx);
         fd_mtxs.erase(sock);
+    }
+    {
+        std::lock_guard<std::mutex> lock(clicrypts_mtx);
+        clicrypts.erase(sock);
     }
     close(sock);
 }

@@ -2,10 +2,19 @@
 
 #include "crypto.h"
 #include <stdexcept>
+#include <bits/stdc++.h>
 
 
 // 构造函数仅创建空对象
 Crypto::Crypto() noexcept : keypr(nullptr, RSA_free){}
+
+
+Crypto::~Crypto() {
+    if (!aeskey.empty()) {
+        OPENSSL_cleanse(aeskey.data(), aeskey.size());
+        // vector 析构会自动释放，无需 clear
+    }
+}
 
 
 // ========== 服务端：产生 RSA 密钥对 ==========
@@ -65,7 +74,6 @@ vecuc Crypto::rsa_encrypt(const vecuc& plain) const {
     );
 
     if (len <= 0) throw std::runtime_error("RSA encryption error");
-
     cipher.resize(len);
     return cipher;
 }
@@ -86,21 +94,21 @@ vecuc Crypto::rsa_decrypt(const vecuc& cipher) const {
     );
 
     if (len <= 0) throw std::runtime_error("RSA decryption error");
+    plain.resize(len);
     return plain;
 }
 
 
 // ========== 客户端：生成随机 AES 密钥 ==========
-vecuc Crypto::generate_rand_aeskey() const {
-    vecuc key(32);
-    if (!RAND_bytes(key.data(), 32)) throw std::runtime_error("Failed to generate AES key");
-    return key;
+void Crypto::generate_rand_aeskey() {
+    aeskey.resize(32);
+    if (!RAND_bytes(aeskey.data(), 32)) throw std::runtime_error("Failed to generate AES key");
 }
 
 
 // ========== AES 加密 ==========
-vecuc Crypto::aes_encrypt(const vecuc& plain, const vecuc& key) const {
-    if (key.size() != 32) throw std::runtime_error("Invalid AES key length");
+vecuc Crypto::aes_encrypt(const vecuc& plain) const {
+    if (aeskey.size() != 32) throw std::runtime_error("Invalid AES key length");
 
     vecuc iv(12);
     if (!RAND_bytes(iv.data(), 12)) throw std::runtime_error("Failed to generate IV");
@@ -108,7 +116,7 @@ vecuc Crypto::aes_encrypt(const vecuc& plain, const vecuc& key) const {
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) throw std::runtime_error("Failed to create AES CTX");
 
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), iv.data()) != 1) {
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, aeskey.data(), iv.data()) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         throw std::runtime_error("AES encryption INIT error");
     }
@@ -145,8 +153,8 @@ vecuc Crypto::aes_encrypt(const vecuc& plain, const vecuc& key) const {
 
 
 // ========== AES 解密 ==========
-vecuc Crypto::aes_decrypt(const vecuc& cipher, const vecuc& key) const {
-    if (cipher.size() < 28 || key.size() != 32) throw std::runtime_error("Invalid length of AES key or cipher");
+vecuc Crypto::aes_decrypt(const vecuc& cipher) const {
+    if (cipher.size() < 28 || aeskey.size() != 32) throw std::runtime_error("Invalid length of AES key or cipher");
 
     vecuc iv(cipher.begin(), cipher.begin() + 12), tag(cipher.end() - 16, cipher.end()), 
         data(cipher.begin() + 12, cipher.end() - 16);
@@ -154,7 +162,7 @@ vecuc Crypto::aes_decrypt(const vecuc& cipher, const vecuc& key) const {
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) throw std::runtime_error("Failed to create AES CTX");
 
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, key.data(), iv.data()) != 1) {
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, aeskey.data(), iv.data()) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         throw std::runtime_error("AES decryption INIT error");
     }
@@ -166,7 +174,7 @@ vecuc Crypto::aes_decrypt(const vecuc& cipher, const vecuc& key) const {
 
     vecuc plain(cipher.size() + EVP_MAX_BLOCK_LENGTH);
     int len;
-    if (EVP_DecryptUpdate(ctx, plain.data(), &len, cipher.data(), static_cast<int>(cipher.size())) != 1) {
+    if (EVP_DecryptUpdate(ctx, plain.data(), &len, data.data(), static_cast<int>(data.size())) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         throw std::runtime_error("AES decryption UPDATE error");
     }
@@ -181,4 +189,20 @@ vecuc Crypto::aes_decrypt(const vecuc& cipher, const vecuc& key) const {
     EVP_CIPHER_CTX_free(ctx);
     plain.resize(totlen);
     return plain;
+}
+
+
+// ========== 重载 AES 加密 ==========
+std::string Crypto::aes_encrypt(const std::string& plainstr) const {
+    vecuc tmp(plainstr.begin(), plainstr.end());
+    vecuc res = aes_encrypt(tmp);
+    return std::string(res.begin(), res.end());
+}
+
+
+// ========== 重载 AES 解密 ==========
+std::string Crypto::aes_decrypt(const std::string& cipherstr) const {
+    vecuc tmp(cipherstr.begin(), cipherstr.end());
+    vecuc res = aes_decrypt(tmp);
+    return std::string(res.begin(), res.end());
 }

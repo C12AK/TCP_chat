@@ -1,3 +1,5 @@
+#include "crypto.h"
+
 #include <iostream>
 #include <cstring>
 #include <format>
@@ -8,6 +10,8 @@
 #include <sys/select.h>
 
 #define BUFSZ 1024
+
+Crypto crypto{};
 
 
 // ==================== 工具函数 ====================
@@ -42,12 +46,26 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Initializing, plz wait...\n" << std::endl;
 
-    // 用户名发给服务器
-    send(sock, argv[3], strlen(argv[3]), 0);
+    char buf[BUFSZ];
+    send(sock, argv[3], strlen(argv[3]), MSG_NOSIGNAL);     // 用户名发给服务器
+    int len = recv(sock, buf, BUFSZ - 1, 0);                // 服务端收到后会发送 RSA 公钥
+    if (len == 0) {
+        std::cout << "Server closed." << std::endl;
+        exit(1);
+    } else if (len < 0) {
+        perror("recv");
+        exit(1);
+    }
+    vecuc pubkey_der(buf, buf + len);                           // 收到 RSA 公钥
+
+    crypto.set_pubkey_from_der(pubkey_der);                     // 设置 RSA 公钥
+    crypto.generate_rand_aeskey();                              // 生成 AES 密钥
+
+    vecuc c_aeskey = crypto.rsa_encrypt(crypto.aeskey);
+    send(sock, c_aeskey.data(), c_aeskey.size(), MSG_NOSIGNAL); // 发送加密的 AES 密钥
 
     fd_set fds;
     int mxfd = std::max(sock, fileno(stdin));
-    char buf[BUFSZ];
     std::string from, to, msg, recvbuf;
     int expected_len = -1;
 
@@ -124,13 +142,15 @@ int main(int argc, char* argv[]) {
 
 // ==================== 工具函数实现 ====================
 inline void send_msg(int sock, const std::string& to, const std::string& msg) {
-    uint16_t n_tolen = htons(static_cast<uint16_t>(to.length()));
-    uint32_t n_msglen = htonl(static_cast<uint32_t>(msg.length()));
+    std::string c_to = crypto.aes_encrypt(to), c_msg = crypto.aes_encrypt(msg);
+
+    uint16_t n_tolen = htons(static_cast<uint16_t>(c_to.length()));
+    uint32_t n_msglen = htonl(static_cast<uint32_t>(c_msg.length()));
     std::string pck;
-    pck.reserve(sizeof(n_tolen) + sizeof(n_msglen) + to.length() + msg.length());
+    pck.reserve(sizeof(n_tolen) + sizeof(n_msglen) + c_to.length() + c_msg.length());
     pck.append(reinterpret_cast<const char*>(&n_tolen), sizeof(n_tolen));
     pck.append(reinterpret_cast<const char*>(&n_msglen), sizeof(n_msglen));
-    pck += to, pck += msg;
+    pck += c_to, pck += c_msg;
 
     Send(sock, pck.c_str(), pck.length());
 }
@@ -153,6 +173,6 @@ inline void process_msg(const char* pckptr, int len, std::string& from, std::str
         return;
     }
 
-    from = std::string(pckptr + 6, fromlen);
-    msg = std::string(pckptr + 6 + fromlen, msglen);
+    from = crypto.aes_decrypt(std::string(pckptr + 6, fromlen));
+    msg = crypto.aes_decrypt(std::string(pckptr + 6 + fromlen, msglen));
 }

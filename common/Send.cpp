@@ -23,4 +23,9 @@ void Send(int sock, const char* sp, int len) {
         sent += n;
         retries = 0;    // 发送成功一次后，重置重试次数
     }
+
+    if (sent < len) {
+        perror("in Send partially sent");
+        return;
+    }
 }
