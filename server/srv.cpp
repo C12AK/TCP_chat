@@ -218,6 +218,21 @@ int main(int argc, char* argv[]) {
                     buf[len] = '\0';
                     std::string username(buf, len);
 
+                    send(cli_sock, rsa_pubkey.data(), rsa_pubkey.size(), MSG_NOSIGNAL);     // 发送 RSA 公钥，也是告知客户端：收到
+                    len = recv(cli_sock, buf, BUFSZ - 1, 0);                                // 客户端收到后会发送加密的 AES 密钥
+                    if (len <= 0) {
+                        std::cout << std::format("New connection closed after sending username: {}:{}", 
+                            inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
+                        close(cli_sock);
+                        return;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(clicrypts_mtx);
+                        clicrypts[cli_sock] = Crypto();
+                        clicrypts[cli_sock].aeskey = main_crypto.rsa_decrypt(vecuc(buf, buf + len));    // 设置这个客户端的 AES 密钥
+                    }
+
                     bool dupf = false;
                     {
                         std::lock_guard<std::mutex> lock(cli_map_mtx);
@@ -241,18 +256,6 @@ int main(int argc, char* argv[]) {
                             inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), username) << std::endl;
                         return;
                     }
-
-                    send(cli_sock, rsa_pubkey.data(), rsa_pubkey.size(), MSG_NOSIGNAL);     // 发送 RSA 公钥，也是告知客户端：收到
-                    len = recv(cli_sock, buf, BUFSZ - 1, 0);                                // 客户端收到后会发送加密的 AES 密钥
-                    if (len <= 0) {
-                        std::cout << std::format("New connection closed after sending username: {}:{}", 
-                            inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
-                        close(cli_sock);
-                        return;
-                    }
-
-                    clicrypts[cli_sock] = Crypto();
-                    clicrypts[cli_sock].aeskey = main_crypto.rsa_decrypt(vecuc(buf, buf + len));    // 设置这个客户端的 aeskey
 
                     set_nonblocking(cli_sock);  // 这里才设置非阻塞
 
@@ -449,7 +452,13 @@ void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, 
     pool.enqueue([fd, from = std::move(from), msg = std::move(msg), mtx_ptr]() {
         std::lock_guard<std::mutex> lock(*mtx_ptr);
         send_msg(fd, from, msg);
-        close(fd);                  // [2] 仅在这里追加
+        
+        // [2] 仅在这里追加。由于先设密钥再验证用户名，在这里要移除密钥
+        {
+            std::lock_guard<std::mutex> lock(clicrypts_mtx);
+            clicrypts.erase(fd);
+        }
+        close(fd);
     });
 }
 
