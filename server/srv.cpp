@@ -95,8 +95,6 @@ vecuc rsa_pubkey;                           // 存一份，省时间
 std::unordered_map<int, Crypto> clicrypts;  // Crypto 类不是线程安全的，故为每个连接创建一个
 std::mutex clicrypts_mtx;
 
-thread_local Crypto crypto{};               // 在 send_msg 和 process_msg 中充当临时变量
-
 
 // ==================== 工具函数 ====================
 // 将 fd 设为非阻塞
@@ -433,28 +431,16 @@ inline void set_nonblocking(int fd) {
 
 
 void submit_send_task(ThreadPool& pool, int fd, const std::string& from, const std::string& msg) {
-    std::shared_ptr<std::mutex> mtx_ptr;    // 在线程任务中安全持有 mutex 的指针，即使 fd 被关闭，只要任务还在执行，mutex 就不会被销毁
-
-    // 查找当前 fd 的mutex
-    {
-        std::lock_guard<std::mutex> lock(fdmtx_map_mtx);
-        auto it = fd_mtxs.find(fd);
-        if (it == fd_mtxs.end()) {
-            auto new_mtx = std::make_unique<std::mutex>();                              // 当前 fd 没有 mutex ，新建一个
-
-            // 通过自定义 deleter 为空的 shared_ptr 借用指针，delete 仍然由 unique_ptr 负责
-            mtx_ptr = std::shared_ptr<std::mutex>(new_mtx.get(), [](std::mutex*){});
-
-            // unique_ptr new_mtx 被转移给 fd_mtxs[fd] ，delete 也就由 fd_mtxs 存的这一项负责了
-            fd_mtxs[fd] = std::move(new_mtx);
-        } else {
-            mtx_ptr = std::shared_ptr<std::mutex>(it->second.get(), [](std::mutex*){}); // 使用已有的 mutex
-        }
-    }
-
     try {
-        pool.enqueue([fd, from = std::move(from), msg = std::move(msg), mtx_ptr]() {
-            std::lock_guard<std::mutex> lock(*mtx_ptr);
+        pool.enqueue([fd, from = std::move(from), msg = std::move(msg)]() {
+            // 查找当前 fd 的 mutex
+            std::unique_lock<std::mutex> lock;
+            {
+                std::lock_guard<std::mutex> map_lock(fdmtx_map_mtx);
+                auto it = fd_mtxs.find(fd);
+                if (it == fd_mtxs.end()) return; // fd 已关闭
+                lock = std::unique_lock<std::mutex>(*it->second);
+            }
             send_msg(fd, from, msg);
         });
     } catch (const std::exception& e) {
@@ -464,23 +450,18 @@ void submit_send_task(ThreadPool& pool, int fd, const std::string& from, const s
 
 
 void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, const std::string& msg) {
-    std::shared_ptr<std::mutex> mtx_ptr;
-    {
-        std::lock_guard<std::mutex> lock(fdmtx_map_mtx);
-        auto it = fd_mtxs.find(fd);
-        if (it == fd_mtxs.end()) {
-            auto new_mtx = std::make_unique<std::mutex>();
-            mtx_ptr = std::shared_ptr<std::mutex>(new_mtx.get(), [](std::mutex*){});
-            fd_mtxs[fd] = std::move(new_mtx);
-        } else {
-            mtx_ptr = std::shared_ptr<std::mutex>(it->second.get(), [](std::mutex*){});
-        }
-    }
     try {
-        pool.enqueue([fd, from = std::move(from), msg = std::move(msg), mtx_ptr]() {
-            std::lock_guard<std::mutex> lock(*mtx_ptr);
+        pool.enqueue([fd, from = std::move(from), msg = std::move(msg)]() {
+            // 查找当前 fd 的 mutex
+            std::unique_lock<std::mutex> lock;
+            {
+                std::lock_guard<std::mutex> map_lock(fdmtx_map_mtx);
+                auto it = fd_mtxs.find(fd);
+                if (it == fd_mtxs.end()) return; // fd 已关闭
+                lock = std::unique_lock<std::mutex>(*it->second);
+            }
             send_msg(fd, from, msg);
-            
+
             // [2] 仅在这里追加。由于先设密钥再验证用户名，在这里要移除密钥
             {
                 std::lock_guard<std::mutex> lock(clicrypts_mtx);
@@ -497,6 +478,7 @@ void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, 
 
 void send_msg(int fd, const std::string& from, const std::string& msg) {
     // 先加密 from 和 msg
+    Crypto crypto{};
     vecuc key;
     {
         std::lock_guard<std::mutex> lock(clicrypts_mtx);
@@ -522,7 +504,11 @@ void send_msg(int fd, const std::string& from, const std::string& msg) {
     pck.append(reinterpret_cast<const char*>(&n_msglen), sizeof(n_msglen));
     pck += c_from, pck += c_msg;
 
-    Send(fd, pck.c_str(), pck.length());
+    try {
+        Send(fd, pck.c_str(), pck.length());
+    } catch (const std::exception& e) {
+        std::cerr << "Send: " << e.what() << std::endl;
+    }
 }
 
 
@@ -544,6 +530,7 @@ void process_msg(int fd, const char* pckptr, int len, std::string& to, std::stri
     }
 
     // 最后解密 to 和 msg
+    Crypto crypto{};
     vecuc key;
     {
         std::lock_guard<std::mutex> lock(clicrypts_mtx);

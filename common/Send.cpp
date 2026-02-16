@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <cerrno>
 #include <unistd.h>
+#include <stdexcept>
 
 #define MAX_RETRIES 100     // 最大重试次数
 
@@ -16,7 +17,7 @@ void Send(int sock, const char* sp, int len) {
                 usleep(1000);   // 发送缓冲区满则稍后重试。更好的实现是检测到 EPOLLOUT 时继续发送，但需要更复杂的整体架构
                 continue;
             } else {
-                perror("send of Send");
+                throw std::runtime_error("send of Send error");
                 return;
             }
         }
@@ -25,7 +26,7 @@ void Send(int sock, const char* sp, int len) {
     }
 
     if (sent < len) {
-        perror("in Send partially sent");
+        throw std::runtime_error("in Send partially sent");
         return;
     }
 }

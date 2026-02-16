@@ -185,7 +185,11 @@ inline void send_msg(int sock, const std::string& to, const std::string& msg) {
     pck.append(reinterpret_cast<const char*>(&n_msglen), sizeof(n_msglen));
     pck += c_to, pck += c_msg;
 
-    Send(sock, pck.c_str(), pck.length());
+    try {
+        Send(sock, pck.c_str(), pck.length());
+    } catch (const std::exception& e) {
+        std::cerr << "Send: " << e.what() << std::endl;
+    }
 }
 
 
