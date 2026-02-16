@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/select.h>
+#include <stdexcept>
 
 #define BUFSZ 1024
 
@@ -51,17 +52,39 @@ int main(int argc, char* argv[]) {
     int len = recv(sock, buf, BUFSZ - 1, 0);                // 服务端收到后会发送 RSA 公钥
     if (len == 0) {
         std::cout << "Server closed." << std::endl;
+        close(sock);
         exit(1);
     } else if (len < 0) {
         perror("recv");
+        close(sock);
         exit(1);
     }
     vecuc pubkey_der(buf, buf + len);                           // 收到 RSA 公钥
 
-    crypto.set_pubkey_from_der(pubkey_der);                     // 设置 RSA 公钥
-    crypto.generate_rand_aeskey();                              // 生成 AES 密钥
+    try {
+        crypto.set_pubkey_from_der(pubkey_der);                 // 设置 RSA 公钥
+    } catch (const std::exception& e) {
+        std::cerr << "Set RSA pubkey: " << e.what() << std::endl;
+        close(sock);
+        exit(1);
+    }
 
-    vecuc c_aeskey = crypto.rsa_encrypt(crypto.aeskey);
+    try{
+        crypto.generate_rand_aeskey();                          // 生成 AES 密钥
+    } catch (const std::exception& e) {
+        std::cerr << "Generate AES key: " << e.what() << std::endl;
+        close(sock);
+        exit(1);
+    }
+
+    vecuc c_aeskey;
+    try {
+        c_aeskey = crypto.rsa_encrypt(crypto.aeskey);
+    } catch (const std::exception& e) {
+        std::cerr << "RSA encrypt: " << e.what() << std::endl;
+        close(sock);
+        exit(1);
+    }
     send(sock, c_aeskey.data(), c_aeskey.size(), MSG_NOSIGNAL); // 发送加密的 AES 密钥
 
     fd_set fds;
@@ -142,7 +165,13 @@ int main(int argc, char* argv[]) {
 
 // ==================== 工具函数实现 ====================
 inline void send_msg(int sock, const std::string& to, const std::string& msg) {
-    std::string c_to = crypto.aes_encrypt(to), c_msg = crypto.aes_encrypt(msg);
+    std::string c_to, c_msg;
+    try {
+        c_to = crypto.aes_encrypt(to), c_msg = crypto.aes_encrypt(msg);
+    } catch (const std::exception& e) {
+        std::cerr << "AES encrypt: " << e.what() << std::endl;
+        return;
+    }
 
     uint16_t n_tolen = htons(static_cast<uint16_t>(c_to.length()));
     uint32_t n_msglen = htonl(static_cast<uint32_t>(c_msg.length()));
@@ -173,6 +202,11 @@ inline void process_msg(const char* pckptr, int len, std::string& from, std::str
         return;
     }
 
-    from = crypto.aes_decrypt(std::string(pckptr + 6, fromlen));
-    msg = crypto.aes_decrypt(std::string(pckptr + 6 + fromlen, msglen));
+    try {
+        from = crypto.aes_decrypt(std::string(pckptr + 6, fromlen));
+        msg = crypto.aes_decrypt(std::string(pckptr + 6 + fromlen, msglen));
+    } catch (const std::exception& e) {
+        std::cerr << "AES decrypt: " << e.what() << std::endl;
+        from.clear(), msg.clear();
+    }
 }
