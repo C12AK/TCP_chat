@@ -28,6 +28,10 @@ int main(int argc, char* argv[]) {
         std::cerr << std::format("Usage: {} <Server IP> <Server Port> <Username>", argv[0]) << std::endl;
         exit(1);
     }
+    if (strlen(argv[3]) > 500ul) {
+        std::cerr << "Username can't be longer than 500 characters" << std::endl;
+        exit(1);
+    }
 
     int sock = socket(PF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
