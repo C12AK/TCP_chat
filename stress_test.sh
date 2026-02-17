@@ -11,8 +11,9 @@ for i in $(seq 1 $CONCURRENCY); do
 
     (
         # 使用 timeout 限制单个客户端运行时间（避免 hang 住）
-        # 将用户名作为输入或参数传入（根据你 cli 的实际逻辑调整）
-        timeout 10s ./cli "$HOST" "$PORT" "$username" >/dev/null 2>&1   # /dev/null 是黑洞设备，用于静默运行程序
+        {
+            echo ".exit"
+        } | timeout 10s ./cli "$HOST" "$PORT" "$username" >/dev/null 2>&1   # /dev/null 是黑洞设备，用于静默运行程序
         if [ $? -eq 0 ]; then
             echo -n "."         # . 代表成功
         else

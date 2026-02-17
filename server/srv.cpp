@@ -22,8 +22,8 @@
 #include <memory>
 #include <stdexcept>
 
-#define BUFSZ 1024
-#define MAX_EVENTS 1024
+#define BUFSZ 1024          // 单次收发消息最大长度
+#define MAX_EVENTS 1024     // epoll 最大事件数
 
 
 // ==================== 线程池 ====================
@@ -210,8 +210,10 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // 由于 cli_sock 还没加入 map ，所以这个任务结束前不会有其他线程 send/recv cli_sock ，所以是安全的
-                // 为了性能 牺牲逻辑清晰度了 qwq
+                // ------------------------------
+                // 待改进。虽然， cli_sock 还没加入 map ，所以这个任务结束前不会有其他线程 send/recv cli_sock ，是安全的；
+                // 但是，线程池最好没有任何阻塞（比如下面的两次 recv）。对于本程序，非阻塞的逻辑会更复杂，暂时搁置了 qwq
+                // ------------------------------
                 try {
                     pool.enqueue([cli_sock, cli_addr, epfd, &pool, &main_crypto]() {
                         int len = recv(cli_sock, buf, BUFSZ - 1, 0);
@@ -224,7 +226,9 @@ int main(int argc, char* argv[]) {
                         buf[len] = '\0';
                         std::string username(buf, len);
 
-                        send(cli_sock, rsa_pubkey.data(), rsa_pubkey.size(), MSG_NOSIGNAL);     // 发送 RSA 公钥，也是告知客户端：收到
+                        int send_len = send(cli_sock, rsa_pubkey.data(), rsa_pubkey.size(), MSG_NOSIGNAL);  // 发送 RSA 公钥，也是告知客户端收到
+                        if (send_len <= 0) return;
+
                         len = recv(cli_sock, buf, BUFSZ - 1, 0);                                // 客户端收到后会发送加密的 AES 密钥
                         if (len <= 0) {
                             std::cout << std::format("New connection closed after sending username: {}:{}", 
@@ -258,6 +262,12 @@ int main(int argc, char* argv[]) {
                                     expected_len[cli_sock] = -1;
                                 }
                             }
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lock(fdmtx_map_mtx);
+                            // 如果当前 fd 没有 mutex ，就创建一个。这样做的理由参考 [4]
+                            if (fd_mtxs.find(cli_sock) == fd_mtxs.end()) fd_mtxs[cli_sock] = std::make_unique<std::mutex>();
                         }
 
                         if (dupf) {
@@ -353,22 +363,30 @@ int main(int argc, char* argv[]) {
                 std::string pck;
                 {
                     std::lock_guard<std::mutex> lock(pcks_mtx);
-                    pcks[fd].append(buf, len);
+                    
+                    // 检查 fd 是否还存在
+                    auto pcks_it = pcks.find(fd);
+                    auto expected_it = expected_len.find(fd);
+                    
+                    if (pcks_it == pcks.end() || expected_it == expected_len.end()) continue;   // 连接已关闭，丢弃数据
+                    
+                    
+                    pcks_it->second.append(buf, len);   // 使用找到的迭代器，而不是 operator[]
 
                     // 设置期望长度
-                    if (expected_len[fd] == -1 && pcks[fd].length() >= 6ul) {
+                    if (expected_it->second == -1 && pcks_it->second.length() >= 6ul) {
                         uint16_t n_tolen;
                         uint32_t n_msglen;
-                        memcpy(&n_tolen, pcks[fd].c_str(), sizeof(n_tolen));
-                        memcpy(&n_msglen, pcks[fd].c_str() + sizeof(n_tolen), sizeof(n_msglen));
-                        expected_len[fd] = 6 + static_cast<int>(ntohs(n_tolen)) + ntohl(n_msglen);
+                        memcpy(&n_tolen, pcks_it->second.c_str(), sizeof(n_tolen));
+                        memcpy(&n_msglen, pcks_it->second.c_str() + sizeof(n_tolen), sizeof(n_msglen));
+                        expected_it->second = 6 + static_cast<int>(ntohs(n_tolen)) + ntohl(n_msglen);
                     }
 
                     // 已经存在一个完整的包，就处理
-                    if (expected_len[fd] != -1 && pcks[fd].length() >= expected_len[fd]) {
-                        pck = pcks[fd].substr(0, expected_len[fd]);
-                        pcks[fd].erase(0, expected_len[fd]);
-                        expected_len[fd] = -1;
+                    if (expected_it->second != -1 && pcks_it->second.length() >= expected_it->second) {
+                        pck = pcks_it->second.substr(0, expected_it->second);
+                        pcks_it->second.erase(0, expected_it->second);
+                        expected_it->second = -1;
                     }
                 }
                 if (pck.empty()) continue;
@@ -433,14 +451,6 @@ inline void set_nonblocking(int fd) {
 void submit_send_task(ThreadPool& pool, int fd, const std::string& from, const std::string& msg) {
     try {
         pool.enqueue([fd, from = std::move(from), msg = std::move(msg)]() {
-            // 查找当前 fd 的 mutex
-            std::unique_lock<std::mutex> lock;
-            {
-                std::lock_guard<std::mutex> map_lock(fdmtx_map_mtx);
-                auto it = fd_mtxs.find(fd);
-                if (it == fd_mtxs.end()) return; // fd 已关闭
-                lock = std::unique_lock<std::mutex>(*it->second);
-            }
             send_msg(fd, from, msg);
         });
     } catch (const std::exception& e) {
@@ -452,23 +462,21 @@ void submit_send_task(ThreadPool& pool, int fd, const std::string& from, const s
 void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, const std::string& msg) {
     try {
         pool.enqueue([fd, from = std::move(from), msg = std::move(msg)]() {
-            // 查找当前 fd 的 mutex
-            std::unique_lock<std::mutex> lock;
-            {
-                std::lock_guard<std::mutex> map_lock(fdmtx_map_mtx);
-                auto it = fd_mtxs.find(fd);
-                if (it == fd_mtxs.end()) return; // fd 已关闭
-                lock = std::unique_lock<std::mutex>(*it->second);
-            }
             send_msg(fd, from, msg);
-
-            // [2] 仅在这里追加。由于先设密钥再验证用户名，在这里要移除密钥
+            // [2] 仅在这里追加
+            {
+                std::lock_guard<std::mutex> lock(pcks_mtx);
+                pcks.erase(fd);
+            }
+            {
+                std::lock_guard<std::mutex> lock(fdmtx_map_mtx);
+                fd_mtxs.erase(fd);
+            }
             {
                 std::lock_guard<std::mutex> lock(clicrypts_mtx);
                 clicrypts.erase(fd);
             }
             close(fd);
-            // [2] 完毕
         });
     } catch (const std::exception& e) {
         std::cerr << "Enqueue: " << e.what() << std::endl;
@@ -478,13 +486,19 @@ void submit_send_task_reject(ThreadPool& pool, int fd, const std::string& from, 
 
 void send_msg(int fd, const std::string& from, const std::string& msg) {
     // 先加密 from 和 msg
-    Crypto crypto{};
     vecuc key;
     {
         std::lock_guard<std::mutex> lock(clicrypts_mtx);
-        key = clicrypts[fd].aeskey;     // 加锁复制，避免在计算密集的加密操作上上锁
+        auto it = clicrypts.find(fd);
+        if (it == clicrypts.end()) {
+            return;
+        }
+        key = it->second.aeskey;    // 加锁复制，避免在计算密集的加密操作上上锁
     }
-    crypto.aeskey = key;
+    if (key.size() != 32) return;
+
+    Crypto crypto{};
+    crypto.aeskey = std::move(key);
 
     std::string c_from, c_msg;
     try {
@@ -505,7 +519,15 @@ void send_msg(int fd, const std::string& from, const std::string& msg) {
     pck += c_from, pck += c_msg;
 
     try {
+        std::unique_lock<std::mutex> lock;
+        {
+            std::lock_guard<std::mutex> map_lock(fdmtx_map_mtx);
+            auto it = fd_mtxs.find(fd);
+            if (it == fd_mtxs.end()) return;
+            lock = std::unique_lock<std::mutex>(*it->second);
+        }
         Send(fd, pck.c_str(), pck.length());
+        // [3]
     } catch (const std::exception& e) {
         std::cerr << "Send: " << e.what() << std::endl;
     }
@@ -529,14 +551,24 @@ void process_msg(int fd, const char* pckptr, int len, std::string& to, std::stri
         return;
     }
 
-    // 最后解密 to 和 msg
-    Crypto crypto{};
     vecuc key;
     {
         std::lock_guard<std::mutex> lock(clicrypts_mtx);
-        key = clicrypts[fd].aeskey;
+        auto it = clicrypts.find(fd);
+        if (it == clicrypts.end()) {
+            to.clear(), msg.clear();
+            return;
+        }
+        key = it->second.aeskey;
     }
-    crypto.aeskey = key;
+    
+    if (key.size() != 32) {
+        to.clear(), msg.clear();
+        return;
+    }
+    
+    Crypto crypto{};
+    crypto.aeskey = std::move(key);
 
     try {
         to = crypto.aes_decrypt(std::string(pckptr + 6, tolen));
@@ -549,20 +581,31 @@ void process_msg(int fd, const char* pckptr, int len, std::string& to, std::stri
 
 
 inline void rm_usr(int sock, const std::string& usr) {
-    usr2sock.erase(usr);    // 保证每次调用时 cli_map_mtx 都已经上锁
+    // ------------------------------
+    // 必须同时持有这么多锁，否则，
+    // 如果在高负载下有一个线程连接后立即断开，就可能导致 [3] 处释放一个不存在的锁        [4]
+    // 也许有更好的实现吧
+    // ------------------------------
+    std::lock_guard<std::mutex> lock1(pcks_mtx);
+    std::lock_guard<std::mutex> lock2(clicrypts_mtx);
+    std::lock_guard<std::mutex> lock3(fdmtx_map_mtx);
+
+    close(sock);            // 目前没分析清楚，这行放在最前也许优于放到后面
+
+    usr2sock.erase(usr);    // 此函数要保证每次调用时 cli_map_mtx 都已经上锁
     sock2usr.erase(sock);
+    
+    pcks.erase(sock);
+    expected_len.erase(sock);
+
+    clicrypts.erase(sock);
+    
+    auto it = fd_mtxs.find(sock);
+    if (it == fd_mtxs.end()) return;
     {
-        std::lock_guard<std::mutex> lock(pcks_mtx);
-        pcks.erase(sock);
-        expected_len.erase(sock);
+        // 占一下要删的锁。等价于检测它未被占用
+        // 由于 fdmtx_map_mtx 已锁，其他任务不可能在此之后立即持有这个锁，也不可能使 it 失效
+        std::lock_guard<std::mutex> lock(*it->second);
     }
-    {
-        std::lock_guard<std::mutex> lock(fdmtx_map_mtx);
-        fd_mtxs.erase(sock);
-    }
-    {
-        std::lock_guard<std::mutex> lock(clicrypts_mtx);
-        clicrypts.erase(sock);
-    }
-    close(sock);
+    fd_mtxs.erase(it);
 }

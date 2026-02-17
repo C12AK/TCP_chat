@@ -16,6 +16,8 @@ void Send(int sock, const char* sp, int len) {
                 retries++;
                 usleep(1000);   // 发送缓冲区满则稍后重试。更好的实现是检测到 EPOLLOUT 时继续发送，但需要更复杂的整体架构
                 continue;
+            } else if (errno == EBADF) {
+                return;         // 对端已关闭，直接结束发送即可
             } else {
                 throw std::runtime_error("send of Send error");
                 return;
