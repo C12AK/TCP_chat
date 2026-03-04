@@ -1,7 +1,6 @@
 # 编译器和标准
 CXX = g++-13
-# CXXFLAGS = -std=c++23 -Wall -Wextra -Werror -g -O2
-CXXFLAGS = -std=c++23 -Wno-deprecated-declarations
+CXXFLAGS = -std=c++23 -Wno-deprecated-declarations -O2
 LDFLAGS = -lssl -lcrypto
 
 # 源文件
