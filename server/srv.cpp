@@ -91,7 +91,6 @@ std::mutex fdmtx_map_mtx;
 
 thread_local char buf[BUFSZ];   // 每个线程一份，收发消息的缓冲区
 
-vecuc rsa_pubkey;                           // 存一份，省时间
 std::unordered_map<int, Crypto> clicrypts;  // Crypto 类不是线程安全的，故为每个连接创建一个
 std::mutex clicrypts_mtx;
 
@@ -172,16 +171,6 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    Crypto main_crypto{};   // 仅 RSA
-    main_crypto.generate_key_pair();
-    rsa_pubkey = main_crypto.get_pubkey_der();
-    if (rsa_pubkey.empty()) {
-        std::cerr << "RSA pubkey empty" << std::endl;
-        close(epfd);
-        close(listen_sock);
-        exit(1);
-    }
-
     std::cout << std::format("Server started on port {}", port) << std::endl;
 
     ThreadPool pool(std::thread::hardware_concurrency());   // 创建线程池，使用硬件支持的并发数
@@ -215,8 +204,8 @@ int main(int argc, char* argv[]) {
                 // 但是，线程池最好没有任何阻塞（比如下面的两次 recv）。对于本程序，非阻塞的逻辑会更复杂，暂时搁置了 qwq
                 // ------------------------------
                 try {
-                    pool.enqueue([cli_sock, cli_addr, epfd, &pool, &main_crypto]() {
-                        int len = recv(cli_sock, buf, BUFSZ - 1, 0);
+                    pool.enqueue([cli_sock, cli_addr, epfd, &pool]() {
+                        int len = recv(cli_sock, buf, BUFSZ - 1, 0);                        // 收到用户名
                         if (len <= 0) {
                             std::cout << std::format("New connection closed on accepting: {}:{}", 
                                 inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
@@ -226,23 +215,34 @@ int main(int argc, char* argv[]) {
                         buf[len] = '\0';
                         std::string username(buf, len);
 
-                        int send_len = send(cli_sock, rsa_pubkey.data(), rsa_pubkey.size(), MSG_NOSIGNAL);  // 发送 RSA 公钥，也是告知客户端收到
-                        if (send_len <= 0) return;
-
-                        len = recv(cli_sock, buf, BUFSZ - 1, 0);                                // 客户端收到后会发送加密的 AES 密钥
-                        if (len <= 0) {
-                            std::cout << std::format("New connection closed after sending username: {}:{}", 
-                                inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
-                            close(cli_sock);
-                            return;
-                        }
-
                         try {
+                            // 为每个连接生成临时的 ECC 密钥对（标准 ECDHE 模式，勿动，借助 main_crypto 的方案不如这个）
+                            Crypto server_crypto{};
+                            server_crypto.generate_ecdh_keypr();
+                            
+                            vecuc server_pubkey = server_crypto.get_ecdh_pubkey();
+                            int send_len = send(cli_sock, server_pubkey.data(), server_pubkey.size(), MSG_NOSIGNAL);
+                            if (send_len <= 0) return;
+
+                            len = recv(cli_sock, buf, BUFSZ - 1, 0);                        // 客户端收到后会发送其 ECC 公钥
+                            if (len <= 0) {
+                                std::cout << std::format("New connection closed after sending server pubkey: {}:{}", 
+                                    inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
+                                close(cli_sock);
+                                return;
+                            }
+
                             std::lock_guard<std::mutex> lock(clicrypts_mtx);
-                            clicrypts[cli_sock] = Crypto();
-                            clicrypts[cli_sock].aeskey = main_crypto.rsa_decrypt(vecuc(buf, buf + len));    // 设置这个客户端的 AES 密钥
+                            server_crypto.set_peer_ecdh_pubkey(vecuc(buf, buf + len));      // 设置客户端的 ECC 公钥
+                            
+                            // 使用固定盐值确保服务器和客户端派生相同的 AES 密钥。另一种方案是发送盐值
+                            static const vecuc fixed_salt = {0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x0f, 0x91, 
+                                                            0x0d, 0x00, 0x07, 0x21, 0xc1, 0x2a, 0xc1, 0x01};
+                            server_crypto.derive_shared_secret(&fixed_salt);                // 计算共享密钥并派生 AES 密钥
+                            
+                            clicrypts[cli_sock] = std::move(server_crypto);
                         } catch (const std::exception& e) {
-                            std::cerr << "RSA decrypt: " << e.what() << std::endl;
+                            std::cerr << "ECDH derive: " << e.what() << std::endl;
                             std::cerr << "Set AES key failed" << std::endl;
                             close(cli_sock);    // 仅仅是这个客户端的问题，断开该连接即可
                             return;

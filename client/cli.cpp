@@ -53,7 +53,7 @@ int main(int argc, char* argv[]) {
 
     char buf[BUFSZ];
     send(sock, argv[3], strlen(argv[3]), MSG_NOSIGNAL);     // 用户名发给服务器
-    int len = recv(sock, buf, BUFSZ - 1, 0);                // 服务端收到后会发送 RSA 公钥
+    int len = recv(sock, buf, BUFSZ - 1, 0);                // 服务端收到后会发送 ECC 公钥
     if (len == 0) {
         std::cout << "Server closed." << std::endl;
         close(sock);
@@ -63,33 +63,32 @@ int main(int argc, char* argv[]) {
         close(sock);
         exit(1);
     }
-    vecuc pubkey_der(buf, buf + len);                           // 收到 RSA 公钥
+    vecuc ecdh_pubkey(buf, buf + len);                      // 收到服务端的 ECC 公钥
 
     try {
-        crypto.set_pubkey_from_der(pubkey_der);                 // 设置 RSA 公钥
+        crypto.generate_ecdh_keypr();                       // 生成 ECC 密钥对
     } catch (const std::exception& e) {
-        std::cerr << "Set RSA pubkey: " << e.what() << std::endl;
+        std::cerr << "Generate ephemeral ECDH keypair: " << e.what() << std::endl;
         close(sock);
         exit(1);
     }
 
-    try{
-        crypto.generate_rand_aeskey();                          // 生成 AES 密钥
-    } catch (const std::exception& e) {
-        std::cerr << "Generate AES key: " << e.what() << std::endl;
-        close(sock);
-        exit(1);
-    }
-
-    vecuc c_aeskey;
+    vecuc client_ecdh_pubkey = crypto.get_ecdh_pubkey();    // 获取客户端 ECC 公钥
+    
     try {
-        c_aeskey = crypto.rsa_encrypt(crypto.aeskey);
+        crypto.set_peer_ecdh_pubkey(ecdh_pubkey);           // 设置服务端 ECC 公钥
+        
+        // 使用与服务器相同的固定盐值
+        static const vecuc fixed_salt = {0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x0f, 0x91, 
+                                        0x0d, 0x00, 0x07, 0x21, 0xc1, 0x2a, 0xc1, 0x01};
+        crypto.derive_shared_secret(&fixed_salt);           // 计算共享密钥并派生 AES 密钥
     } catch (const std::exception& e) {
-        std::cerr << "RSA encrypt: " << e.what() << std::endl;
+        std::cerr << "ECDH derive: " << e.what() << std::endl;
         close(sock);
         exit(1);
     }
-    send(sock, c_aeskey.data(), c_aeskey.size(), MSG_NOSIGNAL); // 发送加密的 AES 密钥
+
+    send(sock, client_ecdh_pubkey.data(), client_ecdh_pubkey.size(), MSG_NOSIGNAL);  // 发送客户端 ECC 公钥
 
     fd_set fds;
     int mxfd = std::max(sock, fileno(stdin));
