@@ -1,5 +1,9 @@
 srv
 cli
 stest
+
 *.o
 */*.o
+
+*.d
+*/*.d
