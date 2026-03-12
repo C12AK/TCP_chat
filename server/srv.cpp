@@ -111,6 +111,9 @@ void send_msg(int fd, const std::string& from, const std::string& msg);
 // 循环发送任意长字符串
 void Send(int sock, const char* sp, int len);
 
+void send_for_ka(int sock, const unsigned char* vp, int len);
+void recv_for_ka(int sock, std::vector<unsigned char>& vp, int& len);
+
 // 拆解收到的消息
 void process_msg(int fd, const char* buf, int len, std::string& to, std::string& msg);
 
@@ -205,15 +208,16 @@ int main(int argc, char* argv[]) {
                 // ------------------------------
                 try {
                     pool.enqueue([cli_sock, cli_addr, epfd, &pool]() {
-                        int len = recv(cli_sock, buf, BUFSZ - 1, 0);                        // 收到用户名
+                        vecuc username_vec;
+                        int len;
+                        recv_for_ka(cli_sock, username_vec, len);
                         if (len <= 0) {
                             std::cout << std::format("New connection closed on accepting: {}:{}", 
                                 inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
                             close(cli_sock);
                             return;
                         }
-                        buf[len] = '\0';
-                        std::string username(buf, len);
+                        std::string username(username_vec.begin(), username_vec.end());
 
                         try {
                             // 为每个连接生成临时的 ECC 密钥对（标准 ECDHE 模式，勿动，借助 main_crypto 的方案不如这个）
@@ -221,10 +225,11 @@ int main(int argc, char* argv[]) {
                             server_crypto.generate_ecdh_keypr();
                             
                             vecuc server_pubkey = server_crypto.get_ecdh_pubkey();
-                            int send_len = send(cli_sock, server_pubkey.data(), server_pubkey.size(), MSG_NOSIGNAL);
-                            if (send_len <= 0) return;
+                            send_for_ka(cli_sock, server_pubkey.data(), server_pubkey.size());
 
-                            len = recv(cli_sock, buf, BUFSZ - 1, 0);                        // 客户端收到后会发送其 ECC 公钥
+                            vecuc cli_pubkey;
+                            int len;
+                            recv_for_ka(cli_sock, cli_pubkey, len);
                             if (len <= 0) {
                                 std::cout << std::format("New connection closed after sending server pubkey: {}:{}", 
                                     inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port)) << std::endl;
@@ -232,14 +237,14 @@ int main(int argc, char* argv[]) {
                                 return;
                             }
 
-                            std::lock_guard<std::mutex> lock(clicrypts_mtx);
-                            server_crypto.set_peer_ecdh_pubkey(vecuc(buf, buf + len));      // 设置客户端的 ECC 公钥
-                            
+                            server_crypto.set_peer_ecdh_pubkey(cli_pubkey);                 // 设置客户端的 ECC 公钥
+
                             // 使用固定盐值确保服务器和客户端派生相同的 AES 密钥。另一种方案是发送盐值
                             static const vecuc fixed_salt = {0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x0f, 0x91, 
                                                             0x0d, 0x00, 0x07, 0x21, 0xc1, 0x2a, 0xc1, 0x01};
                             server_crypto.derive_shared_secret(&fixed_salt);                // 计算共享密钥并派生 AES 密钥
-                            
+
+                            std::lock_guard<std::mutex> lock(clicrypts_mtx);
                             clicrypts[cli_sock] = std::move(server_crypto);
                         } catch (const std::exception& e) {
                             std::cerr << "ECDH derive: " << e.what() << std::endl;

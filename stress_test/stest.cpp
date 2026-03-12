@@ -23,8 +23,11 @@ std::string msg;    // 发送的消息
 
 // ==================== 工具函数声明 ====================
 inline void send_msg(int sock, const std::string& to, const std::string& msg);
-void Send(int sock, const char* sp, int len);
 inline void process_msg(const char* buf, int len, std::string& from, std::string& msg);
+
+void Send(int sock, const char* sp, int len);
+void send_for_ka(int sock, const unsigned char* vp, int len);
+void recv_for_ka(int sock, std::vector<unsigned char>& vp, int& len);
 
 
 // ==================== 子进程 ====================
@@ -49,25 +52,25 @@ void task(const std::string& ip, const std::string& port, const std::string& use
     // ------------------------------
 
     // 初始化连接阶段（不计入 QPS 统计）
-    send(sock, username.c_str(), username.length(), MSG_NOSIGNAL);
-    int len = recv(sock, buf, BUFSZ - 1, 0);
+    send_for_ka(sock, reinterpret_cast<const unsigned char*>(username.c_str()), username.length());
+    vecuc srv_pubkey;
+    int len;
+    recv_for_ka(sock, srv_pubkey, len);
     if (len <= 0) {
         close(sock);
         _exit(1);
     }
-    
-    vecuc ecdh_pubkey(buf, buf + len);
 
     try {
         crypto.generate_ecdh_keypr();
-        vecuc client_ecdh_pubkey = crypto.get_ecdh_pubkey();
-        crypto.set_peer_ecdh_pubkey(ecdh_pubkey);
+        vecuc cli_pubkey = crypto.get_ecdh_pubkey();
+        crypto.set_peer_ecdh_pubkey(srv_pubkey);
         
         static const vecuc fixed_salt = {0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x0f, 0x91, 
                                         0x0d, 0x00, 0x07, 0x21, 0xc1, 0x2a, 0xc1, 0x01};
         crypto.derive_shared_secret(&fixed_salt);
         
-        send(sock, client_ecdh_pubkey.data(), client_ecdh_pubkey.size(), MSG_NOSIGNAL);
+        send_for_ka(sock, cli_pubkey.data(), cli_pubkey.size());
         len = recv(sock, buf, BUFSZ - 1, 0);
         if (len <= 0) {
             close(sock);

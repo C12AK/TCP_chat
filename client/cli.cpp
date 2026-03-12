@@ -17,9 +17,11 @@ Crypto crypto{};
 
 // ==================== 工具函数 ====================
 inline void send_msg(int sock, const std::string& to, const std::string& msg);  // 发送消息
-void Send(int sock, const char* sp, int len);
-
 inline void process_msg(const char* buf, int len, std::string& from, std::string& msg); // 拆解消息
+
+void Send(int sock, const char* sp, int len);
+void send_for_ka(int sock, const unsigned char* vp, int len);
+void recv_for_ka(int sock, std::vector<unsigned char>& vp, int& len);
 
 
 // ==================== 主函数 ====================
@@ -52,8 +54,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Initializing, plz wait...\n" << std::endl;
 
     char buf[BUFSZ];
-    send(sock, argv[3], strlen(argv[3]), MSG_NOSIGNAL);     // 用户名发给服务器
-    int len = recv(sock, buf, BUFSZ - 1, 0);                // 服务端收到后会发送 ECC 公钥
+    send_for_ka(sock, reinterpret_cast<const unsigned char*>(argv[3]), strlen(argv[3]));    // 用户名发给服务器
+
+    vecuc srv_pubkey;
+    int len;
+    recv_for_ka(sock, srv_pubkey, len);                     // 服务端收到后会发送 ECC 公钥
     if (len == 0) {
         std::cout << "Server closed." << std::endl;
         close(sock);
@@ -63,7 +68,6 @@ int main(int argc, char* argv[]) {
         close(sock);
         exit(1);
     }
-    vecuc ecdh_pubkey(buf, buf + len);                      // 收到服务端的 ECC 公钥
 
     try {
         crypto.generate_ecdh_keypr();                       // 生成 ECC 密钥对
@@ -73,10 +77,10 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    vecuc client_ecdh_pubkey = crypto.get_ecdh_pubkey();    // 获取客户端 ECC 公钥
+    vecuc cli_pubkey = crypto.get_ecdh_pubkey();            // 获取客户端 ECC 公钥
     
     try {
-        crypto.set_peer_ecdh_pubkey(ecdh_pubkey);           // 设置服务端 ECC 公钥
+        crypto.set_peer_ecdh_pubkey(srv_pubkey);            // 设置服务端 ECC 公钥
         
         // 使用与服务器相同的固定盐值
         static const vecuc fixed_salt = {0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x0f, 0x91, 
@@ -88,7 +92,7 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    send(sock, client_ecdh_pubkey.data(), client_ecdh_pubkey.size(), MSG_NOSIGNAL);  // 发送客户端 ECC 公钥
+    send_for_ka(sock, cli_pubkey.data(), cli_pubkey.size());    // 发送客户端 ECC 公钥
 
     fd_set fds;
     int mxfd = std::max(sock, fileno(stdin));

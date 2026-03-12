@@ -7,7 +7,7 @@ INCLUDES = -Icommon
 # 源文件
 CLIENT_SRCS = client/cli.cpp
 SERVER_SRCS = server/srv.cpp
-COMMON_SRCS = common/crypto.cpp common/Send.cpp
+COMMON_SRCS = common/crypto.cpp common/send_and_recv.cpp
 TEST_SRCS = stress_test/stest.cpp
 
 # 对应的目标文件
