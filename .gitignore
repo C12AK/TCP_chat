@@ -1,9 +1,10 @@
+# C/C++ 构建产物
 srv
 cli
-stest
-
 *.o
 */*.o
-
 *.d
 */*.d
+
+# Go 构建产物（go.mod / go.sum 需要提交，二进制不提交）
+stress_test/stest

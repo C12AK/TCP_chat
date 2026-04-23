@@ -1,164 +1,140 @@
+#include "aes.h"
+#include "common.h"
 #include "crypto.h"
+#include "net.h"
+#include "protocol.h"
 
-#include <iostream>
+#include <algorithm>
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <format>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
+#include <iostream>
 #include <netinet/in.h>
+#include <string>
 #include <sys/select.h>
-#include <stdexcept>
-
-#define BUFSZ 1024
-
-Crypto crypto{};
+#include <sys/socket.h>
+#include <unistd.h>
 
 
-// ==================== 工具函数 ====================
-inline void send_msg(int sock, const std::string& to, const std::string& msg);  // 发送消息
-inline void process_msg(const char* buf, int len, std::string& from, std::string& msg); // 拆解消息
+#define READ_CHUNK 4096
 
-void Send(int sock, const char* sp, int len);
-void send_for_ka(int sock, const unsigned char* vp, int len);
-void recv_for_ka(int sock, std::vector<unsigned char>& vp, int& len);
+
+// ==================== 握手 ====================
+// 完成 ECDH 握手，返回派生得到的 AES 密钥。失败则抛出异常
+static vecuc do_handshake(int sock, const char* username) {
+    std::string frame = build_ka_frame(std::string(username));
+    blocking_send_all(sock, frame.data(), frame.size());
+
+    vecuc srv_pub;
+    int n = blocking_recv_ka_frame(sock, srv_pub);
+    if (n == 0) throw std::runtime_error("server closed");
+    if (n < 0) throw std::runtime_error("recv server pubkey failed");
+
+    Crypto crypto;
+    crypto.generate_ecdh_keypr();
+    vecuc cli_pub = crypto.get_ecdh_pubkey();
+    crypto.set_peer_ecdh_pubkey(srv_pub);
+    crypto.derive_shared_secret(&FIXED_SALT);
+
+    std::string frame2 = build_ka_frame(cli_pub);
+    blocking_send_all(sock, frame2.data(), frame2.size());
+
+    return std::move(crypto.aeskey);
+}
 
 
 // ==================== 主函数 ====================
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         std::cerr << std::format("Usage: {} <Server IP> <Server Port> <Username>", argv[0]) << std::endl;
-        exit(1);
+        return 1;
     }
-    if (strlen(argv[3]) > 500ul) {
+    if (std::strlen(argv[3]) > 500ul) {
         std::cerr << "Username can't be longer than 500 characters" << std::endl;
-        exit(1);
+        return 1;
     }
 
     int sock = socket(PF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        exit(1);
-    }
+    if (sock < 0) { perror("socket"); return 1; }
 
     sockaddr_in srv_addr{};
     srv_addr.sin_family = AF_INET;
     srv_addr.sin_addr.s_addr = inet_addr(argv[1]);
-    srv_addr.sin_port = htons(atoi(argv[2]));
+    srv_addr.sin_port = htons(std::atoi(argv[2]));
 
-    if (connect(sock, (sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
+    if (connect(sock, reinterpret_cast<sockaddr*>(&srv_addr), sizeof(srv_addr)) < 0) {
         perror("connect");
         close(sock);
-        exit(1);
+        return 1;
     }
     std::cout << "Initializing, plz wait...\n" << std::endl;
 
-    char buf[BUFSZ];
-    send_for_ka(sock, reinterpret_cast<const unsigned char*>(argv[3]), strlen(argv[3]));    // 用户名发给服务器
-
-    vecuc srv_pubkey;
-    int len;
-    recv_for_ka(sock, srv_pubkey, len);                     // 服务端收到后会发送 ECC 公钥
-    if (len == 0) {
-        std::cout << "Server closed." << std::endl;
-        close(sock);
-        exit(1);
-    } else if (len < 0) {
-        perror("recv");
-        close(sock);
-        exit(1);
-    }
-
+    vecuc aeskey;
     try {
-        crypto.generate_ecdh_keypr();                       // 生成 ECC 密钥对
+        aeskey = do_handshake(sock, argv[3]);
     } catch (const std::exception& e) {
-        std::cerr << "Generate ephemeral ECDH keypair: " << e.what() << std::endl;
+        std::cerr << "Handshake: " << e.what() << std::endl;
         close(sock);
-        exit(1);
+        return 1;
     }
 
-    vecuc cli_pubkey = crypto.get_ecdh_pubkey();            // 获取客户端 ECC 公钥
-    
-    try {
-        crypto.set_peer_ecdh_pubkey(srv_pubkey);            // 设置服务端 ECC 公钥
-        
-        // 使用与服务器相同的固定盐值
-        static const vecuc fixed_salt = {0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x0f, 0x91, 
-                                        0x0d, 0x00, 0x07, 0x21, 0xc1, 0x2a, 0xc1, 0x01};
-        crypto.derive_shared_secret(&fixed_salt);           // 计算共享密钥并派生 AES 密钥
-    } catch (const std::exception& e) {
-        std::cerr << "ECDH derive: " << e.what() << std::endl;
-        close(sock);
-        exit(1);
-    }
-
-    send_for_ka(sock, cli_pubkey.data(), cli_pubkey.size());    // 发送客户端 ECC 公钥
-
+    // ==================== 聊天主循环 ====================
+    char buf[READ_CHUNK];
+    std::string to, msg, recvbuf;
     fd_set fds;
     int mxfd = std::max(sock, fileno(stdin));
-    std::string from, to, msg, recvbuf;
-    int expected_len = -1;
 
-    while (1) {
-        // 重新初始化可读事件的文件描述符集合，应包含服务器消息和键盘输入
+    while (true) {
         FD_ZERO(&fds);
         FD_SET(sock, &fds);
         FD_SET(fileno(stdin), &fds);
 
-        // 内核检查的范围是 [0, mxfd+1)；返回值是就绪（即变为可读）的文件描述符数量
         int ready = select(mxfd + 1, &fds, nullptr, nullptr, nullptr);
         if (ready < 0) {
+            if (errno == EINTR) continue;
             perror("select");
             close(sock);
-            exit(1);
+            return 1;
         }
 
-        // 如果是有服务器消息
+        // ---- 服务器消息 ----
         if (FD_ISSET(sock, &fds)) {
-            int len = recv(sock, buf, BUFSZ - 1, 0);
+            int n = recv(sock, buf, sizeof(buf), 0);
+            if (n == 0) { std::cout << "Server closed." << std::endl; break; }
+            if (n < 0) { perror("recv"); break; }
+            recvbuf.append(buf, n);
 
-            // 如果服务器关闭或接收出错
-            if (len == 0) {
-                std::cout << "Server closed." << std::endl;
+            try {
+                while (auto f = parse_chat_frame(recvbuf)) {
+                    std::string from = aes_decrypt(aeskey, f->c_to);
+                    std::string content = aes_decrypt(aeskey, f->c_msg);
+                    std::cout << std::format("\n> {}:\n> {}\n", from, content) << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Recv: " << e.what() << std::endl;
                 break;
-            } else if (len < 0) {
-                perror("recv");
-                break;
-            }
-
-            buf[len] = '\0';
-            recvbuf.append(buf, len);
-
-            // 设置期望长度
-            if (expected_len == -1 && recvbuf.length() >= 6ul) {
-                uint16_t n_fromlen;
-                uint32_t n_msglen;
-                memcpy(&n_fromlen, recvbuf.c_str(), sizeof(n_fromlen));
-                memcpy(&n_msglen, recvbuf.c_str() + sizeof(n_fromlen), sizeof(n_msglen));
-                expected_len = 6 + static_cast<int>(ntohs(n_fromlen)) + ntohl(n_msglen);
-            }
-
-            // 收到的消息长度够了才处理
-            if (expected_len != -1 && recvbuf.length() >= expected_len) {
-                std::string pck = recvbuf.substr(0, expected_len);
-                recvbuf.erase(0, expected_len);
-                expected_len = -1;
-
-                process_msg(pck.c_str(), pck.length(), from, msg);
-                std::cout << format("\n> {}:\n> {}\n", from, msg) << std::endl;
             }
         }
 
-        // 如果是键盘有输入
+        // ---- 键盘输入 ----
         if (FD_ISSET(fileno(stdin), &fds)) {
             if (!std::getline(std::cin, msg) || msg == ".exit") break;
 
-            // 没设收件人则设置
-            if (!to.length()) to = msg;
-
-            else {
-                send_msg(sock, to, msg);
-                to = "";
+            if (to.empty()) {
+                to = msg;
+            } else {
+                try {
+                    std::string frame = build_chat_frame(
+                        aes_encrypt(aeskey, to),
+                        aes_encrypt(aeskey, msg));
+                    blocking_send_all(sock, frame.data(), frame.size());
+                } catch (const std::exception& e) {
+                    std::cerr << "Send: " << e.what() << std::endl;
+                }
+                to.clear();
                 std::cout << "- SENT\n" << std::endl;
             }
         }
@@ -167,57 +143,4 @@ int main(int argc, char* argv[]) {
     close(sock);
     std::cout << "Exited." << std::endl;
     return 0;
-}
-
-
-// ==================== 工具函数实现 ====================
-inline void send_msg(int sock, const std::string& to, const std::string& msg) {
-    std::string c_to, c_msg;
-    try {
-        c_to = crypto.aes_encrypt(to), c_msg = crypto.aes_encrypt(msg);
-    } catch (const std::exception& e) {
-        std::cerr << "AES encrypt: " << e.what() << std::endl;
-        return;
-    }
-
-    uint16_t n_tolen = htons(static_cast<uint16_t>(c_to.length()));
-    uint32_t n_msglen = htonl(static_cast<uint32_t>(c_msg.length()));
-    std::string pck;
-    pck.reserve(sizeof(n_tolen) + sizeof(n_msglen) + c_to.length() + c_msg.length());
-    pck.append(reinterpret_cast<const char*>(&n_tolen), sizeof(n_tolen));
-    pck.append(reinterpret_cast<const char*>(&n_msglen), sizeof(n_msglen));
-    pck += c_to, pck += c_msg;
-
-    try {
-        Send(sock, pck.c_str(), pck.length());
-    } catch (const std::exception& e) {
-        std::cerr << "Send: " << e.what() << std::endl;
-    }
-}
-
-
-inline void process_msg(const char* pckptr, int len, std::string& from, std::string& msg) {
-    if (len < 6) {
-        from.clear(), msg.clear();
-        return;
-    }
-
-    uint16_t n_fromlen;
-    uint32_t n_msglen;
-    std::memcpy(&n_fromlen, pckptr, sizeof(n_fromlen));
-    std::memcpy(&n_msglen, pckptr + sizeof(n_fromlen), sizeof(n_msglen));
-    int fromlen = ntohs(n_fromlen), msglen = ntohl(n_msglen);
-
-    if (fromlen < 0 || msglen < 0 || 6 + fromlen + msglen > len) {
-        from.clear(), msg.clear();
-        return;
-    }
-
-    try {
-        from = crypto.aes_decrypt(std::string(pckptr + 6, fromlen));
-        msg = crypto.aes_decrypt(std::string(pckptr + 6 + fromlen, msglen));
-    } catch (const std::exception& e) {
-        std::cerr << "AES decrypt: " << e.what() << std::endl;
-        from.clear(), msg.clear();
-    }
 }
