@@ -17,7 +17,7 @@
 
 
 // 单线程 Reactor：独占监听 socket、epoll 与所有连接的 I/O 缓冲。
-// CPU 密集的 AES 加解密与目标查询交给 ThreadPool。
+// 短/中消息在 Reactor 内完成 AES 与转发；仅大块密文交给 ThreadPool。
 // 工作线程产出的转发帧以 Action 形式投递回 Reactor，经 eventfd 唤醒
 class Reactor {
   public:
@@ -72,8 +72,8 @@ class Reactor {
 
     // ---- 事件分发 ----
     void on_accept();
-    void on_readable(int fd, uint32_t evs);
-    void on_writable(int fd);
+    void on_readable(Connection& c, uint32_t evs);
+    void on_writable(Connection& c);
     void on_wakeup();
     void sweep_timers();
 
@@ -81,10 +81,16 @@ class Reactor {
     void try_advance_handshake(Connection& c);
     void try_parse_chat_packets(Connection& c);
 
+    // 解密、查表、加密，写入 a。失败返回 false（已打错误日志）
+    bool build_action(const vecuc& src_key, const std::string& from,
+                      const std::string& c_to, const std::string& c_msg,
+                      int src_fd, int src_gen, Action& a);
+
     // ---- 出站 ----
     void enqueue_frame(Connection& c, std::string frame);
     void try_flush(Connection& c);
     void update_epoll_events(Connection& c);
+    void emit_action(Action a);
 
     // ---- 关闭 ----
     void close_conn(int fd, const char* reason);

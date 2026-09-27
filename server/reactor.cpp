@@ -19,6 +19,7 @@
 
 #define MAX_EVENTS 1024
 #define READ_CHUNK 4096
+#define OFFLOAD_CIPHER_BYTES 4096   // 密文合计超过此值才丢给线程池
 
 
 // ==================== 日志（跨线程） ====================
@@ -41,13 +42,17 @@ int64_t now_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// epoll data.ptr 用这两个地址区分 listen / eventfd，其余为 Connection*
+char listen_tag;
+char wake_tag;
+
 }   // namespace
 
 
 // ==================== 构造 / 析构 ====================
 Reactor::Reactor(int port, std::size_t worker_num, int handshake_timeout_ms)
     : port(port), handshake_timeout_ms(handshake_timeout_ms), pool(worker_num) {
-    listen_sock = make_listen_socket(port, 1024);
+    listen_sock = make_listen_socket(port, 4096);
     if (listen_sock < 0) {
         throw std::runtime_error(std::format("make_listen_socket: {}", std::strerror(errno)));
     }
@@ -61,10 +66,10 @@ Reactor::Reactor(int port, std::size_t worker_num, int handshake_timeout_ms)
 
     epoll_event ev{};
     ev.events = EPOLLIN;
-    ev.data.fd = listen_sock;
+    ev.data.ptr = &listen_tag;
     epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &ev);
 
-    ev.data.fd = wake_fd;
+    ev.data.ptr = &wake_tag;
     epoll_ctl(epfd, EPOLL_CTL_ADD, wake_fd, &ev);
 }
 
@@ -107,16 +112,22 @@ void Reactor::run() {
         }
 
         for (int i = 0; i < nfds; ++i) {
-            int fd = events[i].data.fd;
+            void* p = events[i].data.ptr;
             uint32_t evs = events[i].events;
 
-            if (fd == listen_sock) { on_accept(); continue; }
-            if (fd == wake_fd) { on_wakeup(); continue; }
+            if (p == &listen_tag) { on_accept(); continue; }
+            if (p == &wake_tag) { on_wakeup(); continue; }
+
+            auto* c = static_cast<Connection*>(p);
+            int fd = c->fd;
 
             // 关键：必须先 recv 到 EOF / EAGAIN 再关闭，否则当客户端 send + close
             // 的两段报文合并为同一轮事件（EPOLLIN | EPOLLRDHUP）时，会丢弃残留数据
-            if (evs & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) on_readable(fd, evs);
-            if (evs & EPOLLOUT) on_writable(fd);
+            if (evs & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) on_readable(*c, evs);
+            if (evs & EPOLLOUT) {
+                auto it = conns.find(fd);
+                if (it != conns.end()) on_writable(*it->second);
+            }
         }
 
         sweep_timers();
@@ -137,6 +148,8 @@ void Reactor::on_accept() {
             return;
         }
 
+        set_tcp_nodelay(cli_sock);
+
         auto conn = std::make_unique<Connection>();
         conn->fd = cli_sock;
         conn->gen = next_gen++;
@@ -147,7 +160,7 @@ void Reactor::on_accept() {
 
         epoll_event ev{};
         ev.events = EPOLLIN | EPOLLRDHUP;
-        ev.data.fd = cli_sock;
+        ev.data.ptr = conn.get();
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, cli_sock, &ev) < 0) {
             log_err(std::format("epoll_ctl add client: {}", std::strerror(errno)));
             close(cli_sock);
@@ -161,11 +174,8 @@ void Reactor::on_accept() {
 
 
 // ==================== 读事件 ====================
-void Reactor::on_readable(int fd, uint32_t evs) {
-    auto it = conns.find(fd);
-    if (it == conns.end()) return;
-    Connection& c = *it->second;
-
+void Reactor::on_readable(Connection& c, uint32_t evs) {
+    int fd = c.fd;
     bool peer_closed = false;
     char buf[READ_CHUNK];
     while (true) {
@@ -204,7 +214,7 @@ void Reactor::on_readable(int fd, uint32_t evs) {
 // ==================== 握手推进 ====================
 void Reactor::try_advance_handshake(Connection& c) {
     if (c.state == ConnState::WAIT_USERNAME) {
-        auto pl = parse_ka_frame(c.inbuf);
+        auto pl = parse_ka_frame(c.inbuf, c.in_off);
         if (!pl) return;
 
         if (pl->size() > 500) throw std::runtime_error("username too long");
@@ -218,7 +228,7 @@ void Reactor::try_advance_handshake(Connection& c) {
     }
 
     if (c.state == ConnState::WAIT_CLI_PUBKEY) {
-        auto pl = parse_ka_frame(c.inbuf);
+        auto pl = parse_ka_frame(c.inbuf, c.in_off);
         if (!pl) return;
 
         vecuc peer_pub(pl->begin(), pl->end());
@@ -251,13 +261,15 @@ void Reactor::try_advance_handshake(Connection& c) {
         enqueue_frame(c, std::move(welcome));
         log_out(std::format("New connection: {}:{}, Username: {}", c.cli_ip, c.cli_port, c.username));
     }
+
+    compact_buf(c.inbuf, c.in_off);
 }
 
 
-// ==================== 聊天包解析并投递到 worker ====================
+// ==================== 聊天包解析并转发 ====================
 void Reactor::try_parse_chat_packets(Connection& c) {
     while (true) {
-        auto f = parse_chat_frame(c.inbuf);
+        auto f = parse_chat_frame(c.inbuf, c.in_off);
         if (!f) break;
 
         int src_fd = c.fd;
@@ -267,47 +279,74 @@ void Reactor::try_parse_chat_packets(Connection& c) {
         std::string c_to = std::move(f->c_to);
         std::string c_msg = std::move(f->c_msg);
 
+        const bool offload = (c_to.size() + c_msg.size()) >= OFFLOAD_CIPHER_BYTES;
+        if (!offload) {
+            Action a;
+            if (build_action(*src_key, from, c_to, c_msg, src_fd, src_gen, a)) {
+                emit_action(std::move(a));
+            }
+            continue;
+        }
+
         pool.enqueue([this, src_fd, src_gen, src_key = std::move(src_key),
                       from = std::move(from), c_to = std::move(c_to),
                       c_msg = std::move(c_msg)]() mutable {
-            std::string to, msg;
-            try {
-                to = aes_decrypt(*src_key, c_to);
-                msg = aes_decrypt(*src_key, c_msg);
-            } catch (const std::exception& e) {
-                log_err(std::format("AES decrypt: {}", e.what()));
-                return;
-            }
-
-            auto tgt = registry.lookup(to);
-            try {
-                if (!tgt) {
-                    // 无此用户：回给发送者
-                    std::string frame = build_chat_frame(
-                        aes_encrypt(*src_key, std::string("Server")),
-                        aes_encrypt(*src_key, std::string("No such user.")));
-                    post_action({src_fd, src_gen, std::move(frame)});
-                    log_out(std::format("\nFrom: {}\nTo: {} (No such user)\nContent: {}\n", from, to, msg));
-                } else {
-                    std::string frame = build_chat_frame(
-                        aes_encrypt(*tgt->aeskey, from),
-                        aes_encrypt(*tgt->aeskey, msg));
-                    post_action({tgt->fd, tgt->gen, std::move(frame)});
-                    log_out(std::format("\nFrom: {}\nTo: {}\nContent: {}\n", from, to, msg));
-                }
-            } catch (const std::exception& e) {
-                log_err(std::format("AES encrypt: {}", e.what()));
+            Action a;
+            if (build_action(*src_key, from, c_to, c_msg, src_fd, src_gen, a)) {
+                post_action(std::move(a));
             }
         });
     }
+
+    compact_buf(c.inbuf, c.in_off);
+}
+
+
+bool Reactor::build_action(const vecuc& src_key, const std::string& from,
+                           const std::string& c_to, const std::string& c_msg,
+                           int src_fd, int src_gen, Action& a) {
+    std::string to, msg;
+    try {
+        to = aes_decrypt(src_key, c_to);
+        msg = aes_decrypt(src_key, c_msg);
+    } catch (const std::exception& e) {
+        log_err(std::format("AES decrypt: {}", e.what()));
+        return false;
+    }
+
+    auto tgt = registry.lookup(to);
+    try {
+        if (!tgt) {
+            a.fd = src_fd;
+            a.gen = src_gen;
+            a.payload = build_chat_frame(
+                aes_encrypt(src_key, std::string("Server")),
+                aes_encrypt(src_key, std::string("No such user.")));
+        } else {
+            a.fd = tgt->fd;
+            a.gen = tgt->gen;
+            a.payload = build_chat_frame(
+                aes_encrypt(*tgt->aeskey, from),
+                aes_encrypt(*tgt->aeskey, msg));
+        }
+    } catch (const std::exception& e) {
+        log_err(std::format("AES encrypt: {}", e.what()));
+        return false;
+    }
+    return true;
+}
+
+
+void Reactor::emit_action(Action a) {
+    auto it = conns.find(a.fd);
+    if (it == conns.end() || it->second->gen != a.gen) return;
+    enqueue_frame(*it->second, std::move(a.payload));
 }
 
 
 // ==================== 写事件 ====================
-void Reactor::on_writable(int fd) {
-    auto it = conns.find(fd);
-    if (it == conns.end()) return;
-    try_flush(*it->second);
+void Reactor::on_writable(Connection& c) {
+    try_flush(c);
 }
 
 
@@ -352,7 +391,7 @@ void Reactor::update_epoll_events(Connection& c) {
 
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLRDHUP | (want_out ? EPOLLOUT : 0u);
-    ev.data.fd = c.fd;
+    ev.data.ptr = &c;
     epoll_ctl(epfd, EPOLL_CTL_MOD, c.fd, &ev);
     c.epollout_on = want_out;
 }
@@ -384,13 +423,17 @@ void Reactor::close_conn(int fd, const char* reason) {
 
 // ==================== 跨线程唤醒 ====================
 void Reactor::post_action(Action a) {
+    bool need_wake = false;
     {
         std::lock_guard lock(actions_mtx);
+        need_wake = actions.empty();
         actions.emplace_back(std::move(a));
     }
-    uint64_t one = 1;
-    ssize_t w = write(wake_fd, &one, sizeof(one));
-    (void)w;
+    if (need_wake) {
+        uint64_t one = 1;
+        ssize_t w = write(wake_fd, &one, sizeof(one));
+        (void)w;
+    }
 }
 
 
@@ -404,11 +447,7 @@ void Reactor::on_wakeup() {
         local.swap(actions);
     }
 
-    for (auto& a : local) {
-        auto it = conns.find(a.fd);
-        if (it == conns.end() || it->second->gen != a.gen) continue;
-        enqueue_frame(*it->second, std::move(a.payload));
-    }
+    for (auto& a : local) emit_action(std::move(a));
 }
 
 

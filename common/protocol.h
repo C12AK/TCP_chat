@@ -36,6 +36,9 @@ std::string build_ka_frame(const std::string& payload);
 //   协议错误：抛出 std::runtime_error
 std::optional<std::string> parse_ka_frame(std::string& buf);
 
+// 从 buf[off..] 解析一个 KA 帧。成功则推进 off，不移动剩余字节
+std::optional<std::string> parse_ka_frame(const std::string& buf, std::size_t& off);
+
 // 构建 Chat 帧
 std::string build_chat_frame(const std::string& c_to, const std::string& c_msg);
 
@@ -46,5 +49,11 @@ struct ChatFrame {
     std::string c_msg;
 };
 std::optional<ChatFrame> parse_chat_frame(std::string& buf);
+
+// 从 buf[off..] 解析一个 Chat 帧。成功则推进 off，不移动剩余字节
+std::optional<ChatFrame> parse_chat_frame(const std::string& buf, std::size_t& off);
+
+// 丢掉 [0, off) 已消费字节；off==size 时直接 clear
+void compact_buf(std::string& buf, std::size_t& off);
 
 #endif // PROTOCOL_H

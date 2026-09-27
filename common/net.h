@@ -15,6 +15,9 @@ int blocking_recv_ka_frame(int sock, std::vector<unsigned char>& out);
 // 将 fd 设为非阻塞
 void set_nonblocking(int fd);
 
+// 关闭 Nagle，小包立即发出
+void set_tcp_nodelay(int fd);
+
 // 创建并监听 socket（SO_REUSEADDR，IPv4 any）。失败返回 -1
 int make_listen_socket(int port, int backlog);
 

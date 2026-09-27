@@ -22,6 +22,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // 仅大消息进池，可用满核；短消息不走队列，不存在 cond_signal 风暴
     std::size_t worker_num = std::thread::hardware_concurrency();
     if (worker_num == 0) worker_num = 4;
 

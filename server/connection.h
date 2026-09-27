@@ -26,6 +26,7 @@ struct Connection {
 
     // ---- I/O 缓冲 ----
     std::string inbuf;
+    std::size_t in_off = 0;         // inbuf 已消费偏移，避免每帧 erase
     std::deque<std::string> outbuf;
     std::size_t out_head_off = 0;   // outbuf.front() 已发送的字节数
     bool epollout_on = false;

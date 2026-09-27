@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 
 #define BUFSZ 4096
@@ -72,6 +73,13 @@ void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return;
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+
+// ==================== 关闭 Nagle ====================
+void set_tcp_nodelay(int fd) {
+    int opt = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 }
 
 

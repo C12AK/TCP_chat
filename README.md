@@ -4,8 +4,9 @@
 ***
 
 ## 项目特点
-- 服务端采用单线程 Reactor 模式，基于 epoll 和线程池实现万级 QPS
-  - 所有 socket I/O 与连接状态由 Reactor 线程独占，线程池仅承担 CPU 密集的 AES 加解密
+- 服务端采用单线程 Reactor：epoll 独占全部 socket I/O 与连接状态
+  - 短/中消息在 Reactor 内完成 AES 转发，避免线程池往返
+  - 大块密文仍交给线程池，避免大块加解密堵住收发
   - 握手全流程非阻塞，且设有超时保护，异常 / 慢速客户端不会拖累服务
 - 设计应用层协议，既解决了粘包问题，也支持发送任意长度的消息
 - 借助 OpenSSL 库，实现了服务端与客户端之间的 ECDH 密钥协商和 AES-256-GCM 加密通信
@@ -85,8 +86,12 @@ make clean
 
 ***
 
-## 压力测试
-用于评估服务端在稳态下的吞吐。脚本位于 `stress_test/stest.go`，每个模拟客户端会完成完整的握手，然后给自己连发若干条消息（每条等回显再发下一条）。连接与握手阶段不计入 QPS，只有所有客户端都就绪后才开始计时。
+## 压力测试与检查
+脚本位于 `stress_test/stest.go`。连接与握手阶段不计入 QPS，全部就绪后再统一发令。
+
+默认用 **pipeline**：每个连接同时保持若干条在途消息，避免「发一条等一条」把服务器测成延迟墙。`pingpong` 子命令保留旧口径，便于和历史数字对照。`check` 跑功能与边界用例。
+
+延迟：`RTT p50/p95/p99` 是单条 send→对应 echo 的往返（载荷内带时间戳）。`TrueRTT` 是墙钟 / 每连接循环数，表示该并发度下每个连接的串行等效间隔。不要用「墙钟 / 总消息数」当 RTT。
 
 ### 1. 构建
 ```bash
@@ -97,31 +102,20 @@ make stest
 ### 2. 使用方法
 括号内为默认值
 ```
-./stress_test/stest <连接数(1000)> <每个连接发消息数(100)> <每条消息长度(2000)> <服务器IP(127.0.0.1)> <服务器端口(8080)>
+./stress_test/stest check [服务器IP(127.0.0.1)] [端口(8080)]
+./stress_test/stest pingpong [连接数(1000)] [每连接条数(100)] [长度(2000)] [IP] [端口]
+./stress_test/stest pipeline [连接数] [每连接条数] [长度] [IP] [端口] [在途条数(8)]
+./stress_test/stest [连接数] [每连接条数] [长度] [IP] [端口] [在途条数]
 ```
 
 例如：
 ```bash
-./stress_test/stest
-./stress_test/stest 2000 200 500
+./stress_test/stest check 127.0.0.1 8080
+./stress_test/stest pingpong 1000 100 2000
+./stress_test/stest pipeline 1000 100 2000 127.0.0.1 8080 8
 ```
 
 运行前建议 `ulimit -n 65536` 以避免文件描述符耗尽。
-
-### 3. 输出示例
-```
-clients=1000 loops=100 length=2000 addr=127.0.0.1:8080
-----------------------------------------
-Clients   total=1000  ok=1000  conn_err=0  run_err=0
-Loops     100 per client, length=2000 B
-Messages  100000 (echo 往返不另计)
-Setup     272.02 ms  (connect + handshake，不计入 QPS)
-Run       6933.53 ms  (稳态测试时长)
-QPS       14422.67 msgs/sec
-AvgLat    0.0693 ms/msg
-----------------------------------------
-```
-`QPS` 即服务端每秒处理的消息数，`AvgLat` 为端到端平均单次往返耗时。
 
 ***
 

@@ -70,6 +70,7 @@ int main(int argc, char* argv[]) {
         close(sock);
         return 1;
     }
+    set_tcp_nodelay(sock);
     std::cout << "Initializing, plz wait...\n" << std::endl;
 
     vecuc aeskey;
