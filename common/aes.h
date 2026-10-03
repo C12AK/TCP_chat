@@ -13,7 +13,4 @@ vecuc aes_decrypt(const vecuc& key, const vecuc& cipher);
 std::string aes_encrypt(const vecuc& key, const std::string& plainstr);
 std::string aes_decrypt(const vecuc& key, const std::string& cipherstr);
 
-// 预生成的固定盐值，用于 HKDF 派生（服务器 / 客户端使用相同盐值）
-extern const vecuc FIXED_SALT;
-
 #endif // AES_H

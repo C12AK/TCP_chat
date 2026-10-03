@@ -1,16 +1,16 @@
 #ifndef NET_H
 #define NET_H
 
+#include "protocol.h"
+
 #include <cstddef>
 #include <string>
-#include <vector>
 
-// 阻塞式完整发送（客户端 / 压测程序用）。失败抛出 std::runtime_error
+// 阻塞式完整发送（调试客户端用）。失败抛出 std::runtime_error
 void blocking_send_all(int sock, const char* data, std::size_t len);
 
-// 阻塞式接收一个 KA 帧。
-//   返回值：>0 表示载荷字节数；=0 对端关闭；<0 其他错误
-int blocking_recv_ka_frame(int sock, std::vector<unsigned char>& out);
+// 阻塞式接收一帧。返回 1 成功，0 对端关闭，-1 错误
+int blocking_recv_frame(int sock, std::string& acc, Frame& out);
 
 // 将 fd 设为非阻塞
 void set_nonblocking(int fd);

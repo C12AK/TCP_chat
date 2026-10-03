@@ -1,10 +1,31 @@
-# C/C++ 构建产物
-srv
-cli
-*.o
-*/*.o
-*.d
-*/*.d
+# 仓库根目录的可执行文件
+/srv
+/unit_tests
+/live_tests
 
-# Go 构建产物（go.mod / go.sum 需要提交，二进制不提交）
-stress_test/stest
+# 测试程序编出来的可执行文件（源码在 tests/ 里，要提交）
+/tests/unit_tests
+/tests/integration_tests
+/tests/bench/server_bench
+
+# C/C++ 编译中间文件
+*.o
+*.d
+
+# Qt 在 qt_client/ 里 qmake 之后生成的文件（tcp_chat.pro 要提交）
+/qt_client/qt_chat
+/qt_client/Makefile
+/qt_client/.qmake.stash
+/qt_client/moc_*
+
+# SQLite 数据库和它的临时文件
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/data/
+/logs/
+
+# 编辑器私人目录
+.cursor/
+.MyFiles/

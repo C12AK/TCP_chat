@@ -37,7 +37,7 @@ class ThreadPool {
     std::queue<std::function<void()>> task_queue;
     std::mutex queue_mtx;
     std::condition_variable cv;
-    std::atomic<bool> stop;
+    std::atomic<bool> stop; // 析构时置位。为真并且队列已空，工人才退出
 };
 
 #endif // THREAD_POOL_H

@@ -5,13 +5,8 @@
 #include <openssl/rand.h>
 
 
-const vecuc FIXED_SALT = {
-    0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x0f, 0x91,
-    0x0d, 0x00, 0x07, 0x21, 0xc1, 0x2a, 0xc1, 0x01
-};
-
-
 // ========== AES 加密 ==========
+// 输出布局是 12 字节随机 IV、密文、16 字节 GCM 标签。同一明文每次结果不同。
 vecuc aes_encrypt(const vecuc& key, const vecuc& plain) {
     if (key.size() != 32) throw std::runtime_error("Invalid AES key length");
 
@@ -40,7 +35,7 @@ vecuc aes_encrypt(const vecuc& key, const vecuc& plain) {
     }
     totlen += len;
 
-    vecuc tag(16);
+    vecuc tag(16);  // 认证标签。解密时对不上就说明密钥错或密文被改过
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag.data()) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         throw std::runtime_error("Failed to GET AES authentication tag");
@@ -58,6 +53,7 @@ vecuc aes_encrypt(const vecuc& key, const vecuc& plain) {
 
 
 // ========== AES 解密 ==========
+// 输入必须是加密函数的布局。标签校验失败抛异常，不返回半截明文。
 vecuc aes_decrypt(const vecuc& key, const vecuc& cipher) {
     if (cipher.size() < 28 || key.size() != 32) throw std::runtime_error("Invalid length of AES key or cipher");
 
@@ -99,6 +95,7 @@ vecuc aes_decrypt(const vecuc& key, const vecuc& cipher) {
 
 
 // ========== string 重载 ==========
+// 只做 string 和 vecuc 的字节转换，算法在上面两个函数里。
 std::string aes_encrypt(const vecuc& key, const std::string& plainstr) {
     vecuc tmp(plainstr.begin(), plainstr.end());
     vecuc res = aes_encrypt(key, tmp);
@@ -106,6 +103,7 @@ std::string aes_encrypt(const vecuc& key, const std::string& plainstr) {
 }
 
 
+// string 版本的解密，对应上面的加密重载。
 std::string aes_decrypt(const vecuc& key, const std::string& cipherstr) {
     vecuc tmp(cipherstr.begin(), cipherstr.end());
     vecuc res = aes_decrypt(key, tmp);

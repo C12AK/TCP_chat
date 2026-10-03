@@ -14,10 +14,11 @@
 
 
 #define BUFSZ 4096
-#define MAX_RETRIES 100     // 最大重试次数
+#define MAX_RETRIES 100     // 发送缓冲区满时的最多重试次数
 
 
 // ==================== 阻塞式完整发送 ====================
+// 把 len 个字节全部写出去才返回。对端已关则直接结束；其它发送错误抛异常。
 void blocking_send_all(int sock, const char* data, std::size_t len) {
     std::size_t sent = 0;
     int retries = 0;
@@ -40,18 +41,18 @@ void blocking_send_all(int sock, const char* data, std::size_t len) {
 }
 
 
-// ==================== 阻塞式接收一个 KA 帧 ====================
-int blocking_recv_ka_frame(int sock, std::vector<unsigned char>& out) {
-    std::string buf;
+// ==================== 阻塞式接收一帧 ====================
+// 字节不够就继续 recv。返回 1 成功，0 对端关闭，-1 错误或帧非法。buf 里留下还没切走的尾巴。
+int blocking_recv_frame(int sock, std::string& buf, Frame& out) {
     char tmp[BUFSZ];
-
+    std::size_t off = 0;
     while (true) {
-        // 尝试解析现有缓冲区，够了就返回
         try {
-            auto payload = parse_ka_frame(buf);
-            if (payload) {
-                out.assign(payload->begin(), payload->end());
-                return static_cast<int>(out.size());
+            auto frame = parse_frame(buf, off);
+            if (frame) {
+                if (off > 0) buf.erase(0, off);
+                out = std::move(*frame);
+                return 1;
             }
         } catch (const std::exception&) {
             return -1;
@@ -69,6 +70,7 @@ int blocking_recv_ka_frame(int sock, std::vector<unsigned char>& out) {
 
 
 // ==================== fd 设为非阻塞 ====================
+// 之后 read/write 在没有数据时返回 EAGAIN，不会把调用线程睡死。
 void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return;
@@ -77,6 +79,7 @@ void set_nonblocking(int fd) {
 
 
 // ==================== 关闭 Nagle ====================
+// 小帧立刻发出去。开着 Nagle 时，短消息会被内核再攒一会儿。
 void set_tcp_nodelay(int fd) {
     int opt = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
@@ -84,11 +87,13 @@ void set_tcp_nodelay(int fd) {
 
 
 // ==================== 创建监听 socket ====================
+// 绑定所有网卡上的 port。backlog 是已完成握手、还没被 accept 取走的连接能排多深。失败返回 -1。
 int make_listen_socket(int port, int backlog) {
     int sock = socket(PF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
 
     int opt = 1;
+    // 端口还在 TIME_WAIT 时也允许重新绑定，进程重启后能立刻再听
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in addr{};
