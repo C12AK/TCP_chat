@@ -13,7 +13,8 @@
 //   Register            str 用户名, str 密码, str 公钥(32)
 //   Login               str 用户名, str 密码
 //   LoginOk/RegisterOk  u64 用户 id
-//   LoginFail/Kick/Error/QueueBusy  str 原因
+//   LoginFail/Kick           str 原因
+//   Error/QueueBusy          str 原因。聊天失败时再跟 u64 nonce、u64 消息 id（尚未入库则为 0）
 //   Heartbeat           空。只用来刷新空闲计时
 //   SyncReq             u64 本地已有的最大消息 id
 //   SyncBatch           u64 条数，然后重复 Push 的字段

@@ -1,6 +1,10 @@
 #include "session.h"
 
+#include "log.h"
+
 #include <QPair>
+
+#include <string>
 
 namespace {
 
@@ -192,18 +196,33 @@ void Session::handle(MsgType type, const QByteArray& payload) {
     if (type == MsgType::LoginFail || type == MsgType::Error) {
         std::string s;
         r.str(s);
+        uint64_t nonce = 0, msg = 0;
+        if (r.u64(nonce) && r.u64(msg)) {
+            log_error("chat 失败 nonce=" + std::to_string(nonce) + " msg=" + std::to_string(msg) + " " + s);
+        } else if (type == MsgType::LoginFail) {
+            log_error("auth 失败 " + s);
+        } else {
+            log_error("请求失败 " + s);
+        }
         emit failed(QString::fromStdString(s));
         return;
     }
     if (type == MsgType::QueueBusy) {
         std::string s;
         r.str(s);
+        uint64_t nonce = 0, msg = 0;
+        if (r.u64(nonce) && r.u64(msg)) {
+            log_error("chat 失败 nonce=" + std::to_string(nonce) + " msg=" + std::to_string(msg) + " " + s);
+        } else {
+            log_error("queue 失败 " + s);
+        }
         emit queueBusy(QString::fromStdString(s));
         return;
     }
     if (type == MsgType::Kick) {
         std::string s;
         r.str(s);
+        log_error("auth 顶号 " + s);
         emit kicked(QString::fromStdString(s));
         sock_.disconnectFromHost(); // 窗口先收到 kicked，据此不要自动重连
         return;

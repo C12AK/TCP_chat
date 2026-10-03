@@ -28,7 +28,7 @@ cd qt_client && qmake && make && cd ..
 
 `./srv` 只听一个端口。数据库默认是当前目录的 `data/server.db`，也可以 `./srv 8080 /某路径/s.db`。服务端日志在 `logs/server.log`。
 
-每个用户在本机的目录是 `~/.local/share/tcp_chat/<用户id>/`：`identity.key` 是私钥，`chat.db` 是解开后的记录，`client.log` 是客户端日志。目录还在，历史就还在。换电脑或删掉这个目录后，服务器上的密文解不开。
+每个用户在本机的目录是 `~/.local/share/tcp_chat/<用户id>/`：`identity.key` 是私钥，`chat.db` 是解开后的记录，`client.log` 只记失败，合计不超过 1MB。目录还在，历史就还在。换电脑或删掉这个目录后，服务器上的密文解不开。
 
 两个环境变量只作用于服务端：
 

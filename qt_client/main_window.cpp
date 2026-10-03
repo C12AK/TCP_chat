@@ -1,6 +1,9 @@
 #include "main_window.h"
 
 #include "e2e.h"
+#include "log.h"
+
+#include <string>
 
 #include <QDialog>
 #include <QHBoxLayout>
@@ -167,8 +170,10 @@ void MainWindow::onIncoming(const Incoming& msg) {
     if (store_.hasMessage(msg.msgId)) return;
     std::string plain;
     if (!e2e_open(std::string(priv_.constData(), static_cast<std::size_t>(priv_.size())),
-                  std::string(msg.cipher.constData(), static_cast<std::size_t>(msg.cipher.size())), plain))
+                  std::string(msg.cipher.constData(), static_cast<std::size_t>(msg.cipher.size())), plain)) {
+        log_error("chat 失败 nonce=0 msg=" + std::to_string(static_cast<unsigned long long>(msg.msgId)) + " 解密失败");
         return;
+    }
     quint64 sender = msg.senderId;
     store_.upsert(msg.msgId, msg.convId, sender, msg.ts, QString::fromStdString(plain));
     if (sender != selfId_) session_->sendReceipt(1, msg.convId, msg.msgId);
@@ -185,16 +190,17 @@ void MainWindow::onSend() {
     }
     QString text = input_->text();
     if (text.isEmpty()) return;
+    quint64 nonce = QRandomGenerator::global()->generate64(); // 用来让服务器认出重复提交，不承担保密
     QVector<QPair<quint64, QByteArray>> copies;
     for (const auto& m : c->members) {
         std::string blob;
         if (!e2e_seal(std::string(m.pub.constData(), static_cast<std::size_t>(m.pub.size())), text.toStdString(), blob)) {
+            log_error("chat 失败 nonce=" + std::to_string(static_cast<unsigned long long>(nonce)) + " msg=0 加密失败");
             status_->setText("加密失败");
             return;
         }
         copies.push_back({m.id, QByteArray(blob.data(), static_cast<int>(blob.size()))});
     }
-    quint64 nonce = QRandomGenerator::global()->generate64(); // 用来让服务器认出重复提交，不承担保密
     store_.addPending(c->id, nonce, text);
     session_->sendChat(c->id, nonce, copies);
     input_->clear();

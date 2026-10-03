@@ -183,6 +183,7 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
     if (type == MsgType::Heartbeat) return;
 
     if (c.state != ConnState::Ready && type != MsgType::Register && type != MsgType::Login) {
+        log_error(std::format("auth 失败 fd={} 请先登录", c.fd));
         enqueue_frame(c, err_frame("请先登录"));
         return;
     }
@@ -192,6 +193,7 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         std::string user, pass, pub;
         R r(payload);
         if (!r.str(user) || !r.str(pass) || (type == MsgType::Register && !r.str(pub))) {
+            log_error("auth 失败 请求格式不对");
             enqueue_frame(c, err_frame("请求格式不对"));
             return;
         }
@@ -206,6 +208,7 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
                 uint64_t id = 0;
                 std::string err;
                 if (!db.register_user(user, pass, pub, id, err)) {
+                    log_error(std::format("auth 注册失败 name={} {}", user, err));
                     a.frame = err_frame(err);
                 } else {
                     a.kind = 2;
@@ -222,7 +225,7 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
                     W w;
                     w.str(err);
                     a.frame = build_frame(MsgType::LoginFail, w.take());
-                    log_info(std::format("登录失败 name={}", user));
+                    log_error(std::format("auth 登录失败 name={}", user));
                 } else {
                     a.kind = 1;
                     a.user_id = u.id;
@@ -240,6 +243,17 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
     if (!try_acquire(c.user_id)) {
         W w;
         w.str("发送太快，请稍后再试");
+        if (type == MsgType::ChatSend) {
+            uint64_t conv = 0, nonce = 0;
+            R peek(payload);
+            peek.u64(conv);
+            peek.u64(nonce);
+            log_error(std::format("chat 失败 uid={} conv={} nonce={} msg=0 发送太快", c.user_id, conv, nonce));
+            w.u64(nonce);
+            w.u64(0);
+        } else {
+            log_error(std::format("queue 满 uid={} type={}", c.user_id, static_cast<unsigned>(type)));
+        }
         enqueue_frame(c, build_frame(MsgType::QueueBusy, w.take()));
         return;
     }
@@ -256,15 +270,27 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
             ~Guard() { self->release_user(uid); }
         } guard{this, uid};
 
-        auto fail = [&](const std::string& s) { send_frame_to(fd, gen, MsgType::Error, [&] {
-            W w; w.str(s); return w.take();
-        }()); };
+        auto fail = [&](const char* mod, const std::string& s) {
+            log_error(std::format("{} 失败 uid={} {}", mod, uid, s));
+            W w;
+            w.str(s);
+            send_frame_to(fd, gen, MsgType::Error, w.take());
+        };
+        // 聊天失败写出 nonce 和服务器消息 id。还没入库时 msg 为 0，客户端用同一个 nonce 对上这一条。
+        auto chat_fail = [&](uint64_t conv, uint64_t nonce, uint64_t msg, const std::string& why) {
+            log_error(std::format("chat 失败 uid={} conv={} nonce={} msg={} {}", uid, conv, nonce, msg, why));
+            W w;
+            w.str(why);
+            w.u64(nonce);
+            w.u64(msg);
+            send_frame_to(fd, gen, MsgType::Error, w.take());
+        };
 
         // 补拉：只下发收件人是自己的密文。满 100 条时客户端用最后的 id 再要一次
         if (type == MsgType::SyncReq) {
             R r(payload);
             uint64_t after = 0;
-            if (!r.u64(after)) { fail("请求格式不对"); return; }
+            if (!r.u64(after)) { fail("sync", "请求格式不对"); return; }
             auto rows = db.sync_for(uid, after, 100);
             W w;
             w.u64(rows.size());
@@ -284,25 +310,25 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
             R r(payload);
             uint64_t conv = 0, nonce = 0, n = 0;
             if (!r.u64(conv) || !r.u64(nonce) || !r.u64(n) || n == 0 || n > 50) {
-                fail("消息格式不对");
+                chat_fail(conv, nonce, 0, "消息格式不对");
                 return;
             }
             std::vector<Database::MemberSeal> copies;
             for (uint64_t i = 0; i < n; ++i) {
                 Database::MemberSeal s;
-                if (!r.u64(s.user_id) || !r.str(s.ciphertext)) { fail("消息格式不对"); return; }
+                if (!r.u64(s.user_id) || !r.str(s.ciphertext)) { chat_fail(conv, nonce, 0, "消息格式不对"); return; }
                 copies.push_back(std::move(s));
             }
             int kind = 0;
             uint64_t owner = 0;
             if (!db.conv_kind(conv, kind, owner) || kind == 2 || !db.is_member(conv, uid)) {
-                fail("不能往这个会话发消息");
+                chat_fail(conv, nonce, 0, "不能往这个会话发消息");
                 return;
             }
             auto mem = db.members(conv);
-            if (copies.size() != mem.size()) { fail("请为每位成员各封一份"); return; }
+            if (copies.size() != mem.size()) { chat_fail(conv, nonce, 0, "请为每位成员各封一份"); return; }
             for (const auto& s : copies) {
-                if (!db.is_member(conv, s.user_id)) { fail("收件人不是会话成员"); return; }
+                if (!db.is_member(conv, s.user_id)) { chat_fail(conv, nonce, 0, "收件人不是会话成员"); return; }
             }
             uint64_t msg_id = 0;
             bool dup = false;
@@ -311,7 +337,7 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count()),
                     copies, msg_id, dup, err)) {
-                fail(err);
+                chat_fail(conv, nonce, msg_id, err);
                 return;
             }
             W ack;
@@ -338,10 +364,15 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
             R r(payload);
             uint8_t kind = 0;
             uint64_t conv = 0, msg = 0;
-            if (!r.u8(kind) || !r.u64(conv) || !r.u64(msg)) { fail("回执格式不对"); return; }
-            if (kind == 2) db.set_read(uid, conv, msg);
+            if (!r.u8(kind) || !r.u64(conv) || !r.u64(msg)) { chat_fail(conv, 0, msg, "回执格式不对"); return; }
+            if (kind == 2 && !db.set_read(uid, conv, msg)) {
+                log_error(std::format("chat 失败 uid={} conv={} nonce=0 msg={} 已读没记下", uid, conv, msg));
+            }
             uint64_t conv2 = 0, sender = 0;
-            if (!db.message_info(msg, conv2, sender)) return;
+            if (!db.message_info(msg, conv2, sender)) {
+                log_error(std::format("chat 失败 uid={} conv={} nonce=0 msg={} 没有这条消息", uid, conv, msg));
+                return;
+            }
             W w;
             w.u8(kind);
             w.u64(conv2);
@@ -355,7 +386,7 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         if (type == MsgType::FriendSearch) {
             R r(payload);
             std::string name;
-            if (!r.str(name)) { fail("请求格式不对"); return; }
+            if (!r.str(name)) { fail("friend", "请求格式不对"); return; }
             Database::User u;
             int rel = 255;
             W w;
@@ -376,9 +407,9 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         if (type == MsgType::FriendRequest) {
             R r(payload);
             uint64_t to = 0;
-            if (!r.u64(to)) { fail("请求格式不对"); return; }
+            if (!r.u64(to)) { fail("friend", "请求格式不对"); return; }
             std::string err;
-            if (!db.add_request(uid, to, err)) { fail(err); return; }
+            if (!db.add_request(uid, to, err)) { fail("friend", err); return; }
             Database::User me;
             db.user_by_id(uid, me);
             notify_system(to, me.username + " 请求添加你为好友");
@@ -391,10 +422,10 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
             R r(payload);
             uint64_t requester = 0;
             uint8_t accept = 0;
-            if (!r.u64(requester) || !r.u8(accept)) { fail("请求格式不对"); return; }
+            if (!r.u64(requester) || !r.u8(accept)) { fail("friend", "请求格式不对"); return; }
             uint64_t conv = 0;
             std::string err;
-            if (!db.respond_request(uid, requester, accept == 1, conv, err)) { fail(err); return; }
+            if (!db.respond_request(uid, requester, accept == 1, conv, err)) { fail("friend", err); return; }
             Database::User me, other;
             db.user_by_id(uid, me);
             db.user_by_id(requester, other);
@@ -413,9 +444,9 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         if (type == MsgType::FriendDelete) {
             R r(payload);
             uint64_t other = 0;
-            if (!r.u64(other)) { fail("请求格式不对"); return; }
+            if (!r.u64(other)) { fail("friend", "请求格式不对"); return; }
             uint64_t conv = 0;
-            if (!db.delete_friend(uid, other, conv)) { fail("不是好友"); return; }
+            if (!db.delete_friend(uid, other, conv)) { fail("friend", "不是好友"); return; }
             Database::User me, peer;
             db.user_by_id(uid, me);
             db.user_by_id(other, peer);
@@ -430,10 +461,10 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         if (type == MsgType::GroupCreate) {
             R r(payload);
             std::string title;
-            if (!r.str(title)) { fail("请求格式不对"); return; }
+            if (!r.str(title)) { fail("group", "请求格式不对"); return; }
             uint64_t conv = 0;
             std::string err;
-            if (!db.create_group(uid, title, conv, err)) { fail(err); return; }
+            if (!db.create_group(uid, title, conv, err)) { fail("group", err); return; }
             W w;
             w.u64(conv);
             w.str(title);
@@ -445,9 +476,9 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         if (type == MsgType::GroupInvite) {
             R r(payload);
             uint64_t conv = 0, who = 0;
-            if (!r.u64(conv) || !r.u64(who)) { fail("请求格式不对"); return; }
+            if (!r.u64(conv) || !r.u64(who)) { fail("group", "请求格式不对"); return; }
             std::string err;
-            if (!db.invite_group(conv, uid, who, err)) { fail(err); return; }
+            if (!db.invite_group(conv, uid, who, err)) { fail("group", err); return; }
             int kind = 0;
             uint64_t owner = 0;
             db.conv_kind(conv, kind, owner);
@@ -465,9 +496,9 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         if (type == MsgType::GroupLeave) {
             R r(payload);
             uint64_t conv = 0;
-            if (!r.u64(conv)) { fail("请求格式不对"); return; }
+            if (!r.u64(conv)) { fail("group", "请求格式不对"); return; }
             std::string err;
-            if (!db.leave_group(conv, uid, err)) { fail(err); return; }
+            if (!db.leave_group(conv, uid, err)) { fail("group", err); return; }
             send_to_user(uid, conv_list_frame(uid));
             return;
         }
@@ -475,12 +506,12 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
         if (type == MsgType::GroupDissolve) {
             R r(payload);
             uint64_t conv = 0;
-            if (!r.u64(conv)) { fail("请求格式不对"); return; }
+            if (!r.u64(conv)) { fail("group", "请求格式不对"); return; }
             std::string title;
             for (const auto& c : db.list_convs(uid)) if (c.id == conv) title = c.title;
             std::vector<uint64_t> former;
             std::string err;
-            if (!db.dissolve_group(conv, uid, former, err)) { fail(err); return; }
+            if (!db.dissolve_group(conv, uid, former, err)) { fail("group", err); return; }
             for (uint64_t id : former) {
                 if (id == Database::kSystemId) continue;
                 notify_system(id, "群 " + title + " 已解散");
@@ -489,7 +520,7 @@ void Reactor::handle_frame(Connection& c, MsgType type, const std::string& paylo
             return;
         }
 
-        fail("不认识的请求");
+        fail("reactor", "不认识的请求");
     });
 }
 
@@ -527,9 +558,15 @@ std::string Reactor::conv_list_frame(uint64_t user_id) {
 // 系统提示：服务器知道原文，用收件人长期公钥封上再写入系统会话。对方不在线则只留在库里
 void Reactor::notify_system(uint64_t user_id, const std::string& text) {
     Database::User u;
-    if (!db.user_by_id(user_id, u) || u.pubkey.size() != 32) return;
+    if (!db.user_by_id(user_id, u) || u.pubkey.size() != 32) {
+        log_error(std::format("sys 失败 uid={} msg=0 没有公钥", user_id));
+        return;
+    }
     std::string blob;
-    if (!e2e_seal(u.pubkey, text, blob)) return;
+    if (!e2e_seal(u.pubkey, text, blob)) {
+        log_error(std::format("sys 失败 uid={} msg=0 封信失败", user_id));
+        return;
+    }
     uint64_t conv = db.system_conv(user_id);
     uint64_t msg_id = 0;
     bool dup = false;
@@ -537,7 +574,10 @@ void Reactor::notify_system(uint64_t user_id, const std::string& text) {
     std::vector<Database::MemberSeal> copies{{user_id, blob}};
     uint64_t ts = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    if (!db.insert_message(conv, Database::kSystemId, rand_u64(), ts, copies, msg_id, dup, err)) return;
+    if (!db.insert_message(conv, Database::kSystemId, rand_u64(), ts, copies, msg_id, dup, err)) {
+        log_error(std::format("sys 失败 uid={} msg={} {}", user_id, msg_id, err));
+        return;
+    }
     W p;
     p.u64(msg_id);
     p.u64(conv);
@@ -558,6 +598,7 @@ void Reactor::finish_login(Connection& c, uint64_t user_id, const std::string& u
             w.str("账号在别处登录");
             enqueue_frame(*old->second, build_frame(MsgType::Kick, w.take()));
             old->second->state = ConnState::Closing;
+            log_info(std::format("auth 顶号 uid={}", user_id));
         }
     }
     c.state = ConnState::Ready;
@@ -599,7 +640,7 @@ void Reactor::try_flush(Connection& c) {
         return;
     }
     update_epoll_events(c);
-    if (c.state == ConnState::Closing && c.outbuf.empty()) close_conn(c.fd, "closing");
+    if (c.state == ConnState::Closing && c.outbuf.empty()) close_conn(c.fd, "顶号");
 }
 
 // 出站队列非空才监听 EPOLLOUT。空闲连接若一直监听可写，会被反复叫醒。

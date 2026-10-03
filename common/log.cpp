@@ -16,16 +16,20 @@ std::size_t g_file_cap = 0;  // 单个文件写到这里就轮转
 std::ofstream g_out;
 std::size_t g_written = 0;   // 当前这个文件已经写入的字节
 
-// 本地时间戳。localtime_r 把结果写进调用方的 tm，多线程可以同时调用。
+// 本地时间戳，秒后带毫秒。localtime_r 把结果写进调用方的 tm，多线程可以同时调用。
 std::string stamp() {
     using clock = std::chrono::system_clock;
-    auto t = clock::to_time_t(clock::now());
+    auto now = clock::now();
+    auto t = clock::to_time_t(now);
     std::tm tm{};
     localtime_r(&t, &tm);
+    int ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+    if (ms < 0) ms += 1000;
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                  tm.tm_hour, tm.tm_min, tm.tm_sec);
+                  tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
     return buf;
 }
 
