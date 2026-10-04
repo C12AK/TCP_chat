@@ -37,6 +37,7 @@ class MainWindow : public QMainWindow {
   private:
     const ConvInfo* currentConv() const;
     void markRead(const ConvInfo& c);
+    void resendPending(); // 把「发送中」用原来的编号再交一次。名单还没到就先留着
 
     Session* session_;
     Store store_;
@@ -48,6 +49,7 @@ class MainWindow : public QMainWindow {
     QString pass_;
     bool kicked_ = false;   // 被顶号。为真时断开后不要重连，否则会把新登录再踢下去
     bool retrying_ = false; // 正在主动重连。连上之后才在主窗口里重新登录
+    bool resendAfterList_ = false; // 登录后还要把「发送中」再交一次，等会话名单到了再交
     QListWidget* convList_ = nullptr;
     QListWidget* msgList_ = nullptr;
     QLineEdit* search_ = nullptr;

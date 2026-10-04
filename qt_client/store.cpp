@@ -129,6 +129,24 @@ QVector<LocalMsg> Store::load(quint64 convId, const QString& needle) const {
     return out;
 }
 
+// 所有还没有服务器消息 id 的草稿。重连时用原来的 nonce 再交一次。
+QVector<LocalMsg> Store::allPending() const {
+    QVector<LocalMsg> out;
+    sqlite3_stmt* st = nullptr;
+    sqlite3_prepare_v2(db, "SELECT nonce, conv_id, body FROM pending", -1, &st, nullptr);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        LocalMsg m;
+        m.pending = true;
+        m.nonce = static_cast<quint64>(sqlite3_column_int64(st, 0));
+        m.convId = static_cast<quint64>(sqlite3_column_int64(st, 1));
+        auto* text = sqlite3_column_text(st, 2);
+        m.body = text ? QString::fromUtf8(reinterpret_cast<const char*>(text)) : QString();
+        out.push_back(m);
+    }
+    sqlite3_finalize(st);
+    return out;
+}
+
 // 本机已有正文里最大的服务器消息 id。没有行时是 0，上线补拉从这里往后要。
 quint64 Store::maxId() const {
     sqlite3_stmt* st = nullptr;

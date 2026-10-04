@@ -32,6 +32,7 @@ class Store {
     void setStatus(quint64 msgId, int status);                                    // 1 已入库  2 已送达  3 已读
     void hide(quint64 msgId);                                                     // 只从本机列表藏掉，服务器上的密文还在
     QVector<LocalMsg> load(quint64 convId, const QString& needle) const;          // needle 非空时做整段包含
+    QVector<LocalMsg> allPending() const;                                         // 还停在「发送中」的全部草稿，重连后用原编号再交
     quint64 maxId() const;                                                        // 上线补拉的起点
 
   private:

@@ -105,8 +105,13 @@ MainWindow::MainWindow(QWidget* parent, Session* session, quint64 selfId, const 
         retrying_ = false;
         session_->login(user_, pass_);
     });
-    connect(session_, &Session::loginOk, this, [this](quint64) { session_->requestSync(store_.maxId()); }); // 重连成功后补拉。首次登录这信号已经发过
+    connect(session_, &Session::loginOk, this, [this](quint64) {
+        session_->requestSync(store_.maxId()); // 重连成功后补拉。首次登录这信号已经发过
+        resendAfterList_ = true;
+        resendPending();
+    });
 
+    resendAfterList_ = true;
     refreshConvs();
     session_->requestSync(store_.maxId());
 }
@@ -135,6 +140,7 @@ void MainWindow::refreshConvs() {
     if (const auto* c = currentConv()) {
         leaveBtn_->setText(c->kind == 1 && c->owner == selfId_ ? "解散群" : "退出群");
     }
+    resendPending();
 }
 
 // 打开会话时，若还有未读，就把已读回执推到当前列表里的最新消息 id。
@@ -179,6 +185,37 @@ void MainWindow::onIncoming(const Incoming& msg) {
     if (sender != selfId_) session_->sendReceipt(1, msg.convId, msg.msgId);
     refreshMessages();
     refreshConvs();
+}
+
+// 登录后把还停在「发送中」的草稿，按当前成员重新封好，用原来的编号再交一次。
+// 服务器已经收过的只回确认，不再推第二遍。名单还没到就先不交，下次列表更新再试。
+void MainWindow::resendPending() {
+    if (!resendAfterList_) return;
+    if (session_->conversations().isEmpty()) return;
+    resendAfterList_ = false;
+    for (const auto& p : store_.allPending()) {
+        const ConvInfo* conv = nullptr;
+        for (const auto& c : session_->conversations()) {
+            if (c.id == p.convId) {
+                conv = &c;
+                break;
+            }
+        }
+        if (!conv || conv->kind == 2 || conv->members.isEmpty()) continue;
+        QVector<QPair<quint64, QByteArray>> copies;
+        bool sealed = true;
+        for (const auto& m : conv->members) {
+            std::string blob;
+            if (!e2e_seal(std::string(m.pub.constData(), static_cast<std::size_t>(m.pub.size())), p.body.toStdString(), blob)) {
+                log_error("chat 失败 nonce=" + std::to_string(static_cast<unsigned long long>(p.nonce)) + " msg=0 加密失败");
+                sealed = false;
+                break;
+            }
+            copies.push_back({m.id, QByteArray(blob.data(), static_cast<int>(blob.size()))});
+        }
+        if (!sealed) continue;
+        session_->sendChat(p.convId, p.nonce, copies);
+    }
 }
 
 // 发送：当前会话的每个成员各封一份，先在本机记一条「发送中」，再把 ChatSend 交给套接字
